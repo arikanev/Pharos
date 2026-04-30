@@ -142,6 +142,128 @@ def place_beacons(coords: Sequence[LonLat],
 
 
 # --------------------------------------------------------------------------- #
+# Autotune (Pareto search over angle x max_chord)
+# --------------------------------------------------------------------------- #
+
+# 1 deg of latitude in feet (constant) and 1 deg of longitude at given latitude.
+_DEG_TO_FT = math.pi / 180.0 * EARTH_RADIUS_FT
+
+
+def chord_drift_ft(samples: Sequence[LonLat],
+                   indices: Sequence[int]) -> float:
+    """Worst perpendicular distance (ft) of any sample from its chord.
+
+    Uses a local equirectangular projection per chord; accurate to <1% over
+    chords below a few miles, which is fine for any walking route.
+    """
+    worst = 0.0
+    for k in range(len(indices) - 1):
+        a, b = samples[indices[k]], samples[indices[k + 1]]
+        lat0 = math.radians((a[1] + b[1]) / 2.0)
+        sx = _DEG_TO_FT * math.cos(lat0)
+        sy = _DEG_TO_FT
+        bx, by = (b[0] - a[0]) * sx, (b[1] - a[1]) * sy
+        L = math.hypot(bx, by) or 1.0
+        for j in range(indices[k] + 1, indices[k + 1]):
+            p = samples[j]
+            px, py = (p[0] - a[0]) * sx, (p[1] - a[1]) * sy
+            d = abs(px * by - py * bx) / L
+            if d > worst:
+                worst = d
+    return worst
+
+
+@dataclass
+class TuneResult:
+    angle_deg: float
+    max_chord_ft: float | None
+    drift_ft: float
+    beacons: int
+    result: BeaconResult
+
+
+_AUTOTUNE_ANGLES: Tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 6.0, 8.0,
+                                       12.0, 16.0, 24.0)
+_AUTOTUNE_CAPS: Tuple[float | None, ...] = (60.0, 90.0, 120.0, 150.0, 200.0,
+                                            300.0, 500.0, 800.0, 1500.0, None)
+
+
+def pareto_frontier(coords: Sequence[LonLat],
+                    step_ft: float = 20.0,
+                    angles: Sequence[float] = _AUTOTUNE_ANGLES,
+                    max_chords: Sequence[float | None] = _AUTOTUNE_CAPS,
+                    min_spacing_ft: float | None = None,
+                    ) -> List[TuneResult]:
+    """Sweep (angle, max_chord) and return the Pareto-optimal points.
+
+    If ``min_spacing_ft`` is supplied, ``enforce_min_spacing`` is applied
+    to each candidate before measuring drift -- this is critical because
+    merging adjacent beacons increases chord lengths and therefore drift.
+    A point is on the frontier if no other point has both fewer beacons
+    AND less drift.  Returned list is sorted by drift (ascending) and,
+    equivalently, by beacon count (descending).
+    """
+    points: List[TuneResult] = []
+    for ang in angles:
+        for cap in max_chords:
+            r = place_beacons(coords, ang, step_ft, max_chord_ft=cap)
+            if min_spacing_ft:
+                r = enforce_min_spacing(r, min_spacing_ft)
+            d = chord_drift_ft(r.samples, r.indices)
+            points.append(TuneResult(ang, cap, d, len(r.beacons), r))
+    points.sort(key=lambda p: (p.drift_ft, p.beacons))
+    pareto: List[TuneResult] = []
+    best_b = float("inf")
+    for p in points:
+        if p.beacons < best_b:
+            pareto.append(p)
+            best_b = p.beacons
+    return pareto
+
+
+def autotune(coords: Sequence[LonLat],
+             max_drift_ft: float,
+             step_ft: float = 20.0,
+             min_spacing_ft: float | None = None,
+             **kw) -> TuneResult:
+    """Pick the Pareto-optimal setting that meets a worst-drift budget.
+
+    Returns the entry with the fewest beacons whose ``drift_ft`` is at or
+    below ``max_drift_ft`` (after any ``min_spacing_ft`` merging).  If no
+    setting meets the budget, returns the tightest one we tried.
+    """
+    points = pareto_frontier(coords, step_ft,
+                             min_spacing_ft=min_spacing_ft, **kw)
+    feasible = [p for p in points if p.drift_ft <= max_drift_ft]
+    return (min(feasible, key=lambda p: p.beacons) if feasible
+            else min(points, key=lambda p: p.drift_ft))
+
+
+def enforce_min_spacing(result: BeaconResult,
+                        min_spacing_ft: float) -> BeaconResult:
+    """Drop intermediate beacons closer than ``min_spacing_ft`` to the
+    previous kept beacon; endpoints are always retained.
+
+    Useful for audio waypoint navigation, where two beacons closer than the
+    spatial-audio resolution floor cause useless / disorienting transitions.
+    """
+    if min_spacing_ft <= 0 or len(result.beacons) <= 2:
+        return result
+    keep = [0]
+    last = result.beacons[0]
+    for i in range(1, len(result.beacons) - 1):
+        if haversine_ft(last, result.beacons[i]) >= min_spacing_ft:
+            keep.append(i)
+            last = result.beacons[i]
+    keep.append(len(result.beacons) - 1)
+    return BeaconResult(
+        beacons=[result.beacons[i] for i in keep],
+        samples=result.samples,
+        indices=[result.indices[i] for i in keep],
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Demo data
 # --------------------------------------------------------------------------- #
 
@@ -352,6 +474,24 @@ def main() -> None:
     p.add_argument("--max-chord", type=float, default=None,
                    help="optional cap on chord length in feet "
                         "(splits long straights; default: no cap)")
+    p.add_argument("--autotune-drift", type=float, default=None,
+                   metavar="FT",
+                   help="pick (angle, max_chord) automatically to keep "
+                        "worst-case perpendicular drift below this many feet "
+                        "while minimizing beacon count")
+    p.add_argument("--soundscape", action="store_true",
+                   help="audio-nav preset: --autotune-drift = path_width/2 "
+                        "and --min-spacing default of 65 ft (~20 m)")
+    p.add_argument("--path-width", type=float, default=10.0, metavar="FT",
+                   help="walkable corridor width in feet (default 10); "
+                        "used by --soundscape to set the drift budget")
+    p.add_argument("--min-spacing", type=float, default=None, metavar="FT",
+                   help="post-process: drop beacons closer than this many "
+                        "feet to the previous kept beacon (endpoints always "
+                        "kept)")
+    p.add_argument("--pareto", action="store_true",
+                   help="print the Pareto frontier of (drift, beacons) for "
+                        "the route and exit (no plot)")
     p.add_argument("--start", metavar="LON,LAT",
                    help="route start coordinate (use with --end to fetch OSM)")
     p.add_argument("--end", metavar="LON,LAT",
@@ -374,13 +514,67 @@ def main() -> None:
         coords = synthetic_route()
         title_extra = "synthetic route"
 
-    result = place_beacons(coords, args.angle, args.step,
-                           max_chord_ft=args.max_chord)
     total_ft = sum(haversine_ft(a, b)
                    for a, b in zip(coords[:-1], coords[1:]))
+
+    drift_budget = (args.path_width / 2.0 if args.soundscape
+                    else args.autotune_drift)
+    min_spacing = args.min_spacing
+    if args.soundscape and min_spacing is None:
+        min_spacing = 65.0
+
+    if args.pareto:
+        points = pareto_frontier(coords, args.step,
+                                 min_spacing_ft=min_spacing)
+        print(f"Route length      : {total_ft:,.0f} ft"
+              + (f"  |  min_spacing = {min_spacing:g} ft"
+                 if min_spacing else ""))
+        print(f"Pareto frontier (lower drift => more beacons):")
+        print(f"  {'drift_ft':>9}  {'beacons':>8}  "
+              f"{'angle':>5}  {'max_chord':>10}  {'avg_spacing_ft':>14}")
+        for tp in points:
+            cap = "none" if tp.max_chord_ft is None else f"{tp.max_chord_ft:.0f}"
+            spacing = total_ft / max(tp.beacons - 1, 1)
+            print(f"  {tp.drift_ft:>9.1f}  {tp.beacons:>8}  "
+                  f"{tp.angle_deg:>5g}  {cap:>10}  {spacing:>14,.0f}")
+        return
+
+    if drift_budget is not None:
+        chosen = autotune(coords, max_drift_ft=drift_budget,
+                          step_ft=args.step,
+                          min_spacing_ft=min_spacing)
+        result = chosen.result
+        cap_str = ("none" if chosen.max_chord_ft is None
+                   else f"{chosen.max_chord_ft:.0f} ft")
+        met = chosen.drift_ft <= drift_budget
+        title_extra += (f" | autotune drift\u2264{drift_budget:g}ft "
+                        f"(angle={chosen.angle_deg:g}, max_chord={cap_str})")
+        print(f"Autotune target   : drift \u2264 {drift_budget:g} ft"
+              + (f" | min_spacing = {min_spacing:g} ft"
+                 if min_spacing else ""))
+        print(f"  chosen          : angle={chosen.angle_deg:g}deg, "
+              f"max_chord={cap_str}")
+        print(f"  measured drift  : {chosen.drift_ft:.1f} ft "
+              f"({'OK' if met else 'BUDGET NOT MET'})")
+        if not met:
+            hint = ("  hint            : try --min-spacing smaller, "
+                    "--path-width larger, or run --pareto to see all options")
+            print(hint)
+    else:
+        result = place_beacons(coords, args.angle, args.step,
+                               max_chord_ft=args.max_chord)
+        if min_spacing is not None:
+            before = len(result.beacons)
+            result = enforce_min_spacing(result, min_spacing)
+            print(f"Min-spacing      : {min_spacing:g} ft "
+                  f"({before} -> {len(result.beacons)} beacons)")
+
     print(f"Route length      : {total_ft:,.0f} ft")
     print(f"Resampled points  : {len(result.samples)}")
     print(f"Beacons planted   : {len(result.beacons)}")
+    if len(result.beacons) >= 2:
+        print(f"Avg beacon spacing: "
+              f"{total_ft / (len(result.beacons) - 1):,.0f} ft")
 
     plot_result(result, coords, args.angle, args.step, title_extra)
 
