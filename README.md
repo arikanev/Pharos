@@ -73,10 +73,8 @@ in-process).
 | `--angle`           | max angular drift of any chord (degrees)                                 | `8`     |
 | `--step`            | route resampling step (feet)                                             | `20`    |
 | `--max-chord`       | optional cap on chord length (feet); splits long straights so the chord cannot drift more than `max_chord * tan(angle)` from the route | none    |
-| `--autotune-drift`  | pick `(angle, max-chord)` automatically to keep worst drift ≤ given feet, minimizing beacons | --   |
-| `--soundscape`      | audio-nav preset: sets drift budget = `path-width / 2` and min-spacing = 65 ft (~20 m) | off |
-| `--path-width`      | walkable corridor width in feet (used by `--soundscape` to set drift budget) | `10` |
-| `--min-spacing`     | post-process: drop beacons closer than this many feet to the previous kept one (endpoints always kept) | none |
+| `--autotune-drift`  | pick `(angle, max-chord, min-spacing)` automatically to keep worst drift ≤ given feet while minimizing beacons / maximizing spacing | --   |
+| `--min-spacing`     | pin a hard floor on beacon spacing in feet; if omitted, `--autotune-drift` sweeps it and picks the largest value that still meets the drift budget | none |
 | `--pareto`          | print the full `(drift, beacons)` Pareto frontier and exit (no plot)     | off     |
 | `--profile`         | `auto` \| `pedestrian` \| `bicycle`                                      | `auto`  |
 | `--start`           | route start `lon,lat` for live OSM-routed run                            | --      |
@@ -108,50 +106,82 @@ Measured on a real Central Park bicycle route:
 
 ## Autotune
 
-Picking `(angle, max-chord)` by hand is error-prone — the right value depends
-on the route's curvature. `--autotune-drift FT` does a Pareto sweep and
-returns the setting with the **fewest beacons** whose worst-case drift is
-≤ the given budget:
+Picking `(angle, max-chord, min-spacing)` by hand is error-prone -- the right
+values depend on the route's curvature. `--autotune-drift FT` does a Pareto
+sweep over all three knobs and returns the setting with the **fewest
+beacons** (equivalently, the **largest min-spacing**) whose worst-case
+drift is ≤ the given budget:
 
 ```bash
 python beacon_placement.py --autotune-drift 25 \
     --profile bicycle --start=-73.973,40.770 --end=-73.965,40.785
 # Autotune target   : drift ≤ 25 ft
-#   chosen          : angle=8 deg, max_chord=300 ft
-#   measured drift  : 22.2 ft (OK)
-# Beacons planted   : 52
+#   chosen angle    : 4 deg
+#   chosen max_chord: 800 ft
+#   chosen spacing  : 150 ft (auto)
+#   measured drift  : 24.8 ft (OK)
+# Beacons planted   : 30
 ```
 
-`--pareto` prints the full trade-off table for the route so you can pick a
-point manually.
+If you pass `--min-spacing FT` explicitly, that floor is **pinned** and the
+autotune searches only `(angle, max-chord)`. If it can't satisfy both
+constraints at once on a curvy route the result is flagged
+`BUDGET NOT MET` -- raise `--autotune-drift`, drop `--min-spacing`, or run
+`--pareto` to see all options.
 
-## Audio waypoint navigation (Soundscape)
+`--pareto` prints the full `(drift, beacons, angle, max_chord, min_spacing)`
+trade-off table so you can pick a point manually.
+
+## Audio waypoint navigation (Soundscape recipe)
 
 For spatial-audio nav (e.g. the
-[Soundscape Community](https://github.com/Soundscape-community) iOS app
-which guides blind users with panning sound), drift should stay inside the
-**walkable corridor** and beacons shouldn't transition faster than the user
-can re-acquire direction (~30 sec at walking pace; ~20 m apart minimum).
+[Soundscape Community](https://github.com/Soundscape-community) iOS app,
+which guides blind users with panning sound), there are two competing
+constraints:
 
-`--soundscape` wraps both rules into one preset:
+* the chord between consecutive beacons must stay inside the **walkable
+  corridor**, otherwise the user is being audibly steered off the path;
+* beacons shouldn't transition faster than the user can re-acquire
+  direction -- the spatial-audio resolution floor is around 20 m and most
+  audio-nav UX research recommends one transition every 30 sec or more
+  at walking pace.
 
-* drift budget = `--path-width / 2` (so the chord stays inside the corridor)
-* min-spacing  = 65 ft (~20 m, audio-resolution floor) -- override with `--min-spacing`
+You only need to set the drift budget. Just pass:
+
+```
+--autotune-drift  =  corridor_width_in_feet / 2     # keeps chord inside corridor
+```
+
+The autotune **automatically picks the largest min-spacing** the route can
+support at that drift level -- so beacon transitions are as infrequent as
+the curvature allows.
+
+Examples:
 
 ```bash
-# 10 ft footpath, default 65 ft min-spacing
-python beacon_placement.py --soundscape --path-width 10 \
+# 10 ft footpath -- drift budget 5 ft; min-spacing chosen automatically
+python beacon_placement.py --autotune-drift 5 \
     --profile pedestrian --start=-73.973,40.770 --end=-73.965,40.785
 
-# 6 ft sidewalk, allow tighter beacon spacing on sharp curves
-python beacon_placement.py --soundscape --path-width 6 --min-spacing 30 \
+# 6 ft sidewalk -- drift budget 3 ft
+python beacon_placement.py --autotune-drift 3 \
+    --profile pedestrian --start=... --end=...
+
+# 15 ft promenade -- drift budget 7.5 ft
+python beacon_placement.py --autotune-drift 7.5 \
     --profile pedestrian --start=... --end=...
 ```
 
-If the route is too curvy to satisfy both at once (e.g. tight switchbacks
-with wide min-spacing), the autotune returns the closest feasible setting
-and prints `BUDGET NOT MET` along with a hint to relax one of the two
-constraints.
+The output will report the chosen min-spacing -- e.g. on a curvy footpath
+with a tight 5 ft drift budget, the autotune may report `min_spacing =
+none (auto)` because any forced merging exceeds the drift budget. On a
+straighter route or with a larger drift budget you'll see `min_spacing =
+150 ft (auto)`, dropping beacon count substantially.
+
+If you do want to **pin** the min-spacing (e.g. you want to guarantee at
+least one transition per 20 m for UX consistency, even at the cost of
+some drift), pass `--min-spacing 65` explicitly. If both budgets can't be
+met simultaneously the result is flagged `BUDGET NOT MET` with a hint.
 
 ## Examples gallery
 
@@ -175,11 +205,14 @@ coords  = fetch_route((-73.973, 40.770), (-73.965, 40.785),
 result  = place_beacons(coords, angle_threshold_deg=8,
                         step_ft=20, max_chord_ft=300)
 
-# Autotune to a drift budget, with Soundscape-style audio min-spacing:
-tune    = autotune(coords, max_drift_ft=5,             # half of 10 ft path width
-                   step_ft=20, min_spacing_ft=65)      # ~20 m
+# Autotune to a drift budget; min-spacing chosen automatically:
+tune    = autotune(coords, max_drift_ft=5, step_ft=20)
 result  = tune.result
-print(tune.angle_deg, tune.max_chord_ft, tune.drift_ft, tune.beacons)
+print(tune.angle_deg, tune.max_chord_ft, tune.min_spacing_ft,
+      tune.drift_ft, tune.beacons)
+
+# Or pin min-spacing explicitly (autotune searches angle/max_chord only):
+tune    = autotune(coords, max_drift_ft=5, step_ft=20, min_spacing_ft=65)
 
 beacons = result.beacons   # list of (lon, lat) tuples
 ```
