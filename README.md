@@ -28,7 +28,10 @@ points.
 5. Repeat until the end of the route, then plant a final beacon on the
    destination.
 
-Single forward pass, no backtracking, O(n) per beacon planted.
+Single forward pass, no backtracking. Each resampled point is examined a
+constant number of times across the whole run, so the algorithm is **O(n)**
+total in the number of samples (not per beacon planted) and uses O(k)
+extra memory for the k beacons it plants.
 
 ## Quick start
 
