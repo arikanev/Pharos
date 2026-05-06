@@ -7,7 +7,7 @@ Run as a script for a self-contained matplotlib demo:
     python beacon_placement.py --angle 5 --step 15                        # tighter
     python beacon_placement.py --start=-73.985,40.748 --end=-73.965,40.760  # real OSM
 
-The algorithm is a greedy forward walk; see README.md for a description.
+The algorithm is a greedy forward walk; see ALGORITHM.md for a description.
 """
 
 from __future__ import annotations
