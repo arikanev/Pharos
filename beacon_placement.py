@@ -323,8 +323,14 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def _http_json(req: "str | urllib.request.Request", timeout: float = 30) -> dict:
-    """GET/POST JSON with shared SSL context and a clean SSL error hint."""
+def _http_json(req: "str | urllib.request.Request", timeout: float = 10) -> dict:
+    """GET/POST JSON with shared SSL context and a clean SSL error hint.
+
+    Default timeout is intentionally short (10s): the public OSM routing
+    endpoints either respond in well under a second or are unreachable;
+    waiting 30s+ on a stalled TCP connect is just wasted time when we have
+    a fallback backend ready to try next.
+    """
     if isinstance(req, str):
         req = urllib.request.Request(req)
     req.add_header("User-Agent", _USER_AGENT)
@@ -366,12 +372,34 @@ def _decode_polyline(s: str, precision: int = 6) -> List[LonLat]:
     return coords
 
 
-def osrm_route(start: LonLat, end: LonLat) -> List[LonLat]:
-    """Fetch an OSM-backed driving route polyline from the public OSRM router."""
-    url = ("https://router.project-osrm.org/route/v1/driving/"
+# OSRM endpoints. `driving` lives on the project-osrm demo; `foot`/`bike`
+# live on the FOSSGIS-hosted `routing.openstreetmap.de` mirrors and -- unlike
+# Valhalla's public demo -- have been reliably available, so we use them as
+# the primary pedestrian/bicycle backend.
+_OSRM_ENDPOINTS = {
+    "driving": "https://router.project-osrm.org/route/v1/driving",
+    "foot":    "https://routing.openstreetmap.de/routed-foot/route/v1/foot",
+    "bike":    "https://routing.openstreetmap.de/routed-bike/route/v1/bike",
+}
+
+
+def osrm_route(start: LonLat, end: LonLat,
+               profile: str = "driving") -> List[LonLat]:
+    """Fetch an OSM-backed route polyline from a public OSRM mirror.
+
+    `profile` is one of `driving`, `foot`, `bike`. `foot` and `bike` traverse
+    OSM `highway=footway`/`path`/`cycleway`, which the driving graph does not
+    include.
+    """
+    if profile not in _OSRM_ENDPOINTS:
+        raise ValueError(f"unknown OSRM profile {profile!r}; "
+                         f"choose one of {sorted(_OSRM_ENDPOINTS)}")
+    url = (f"{_OSRM_ENDPOINTS[profile]}/"
            f"{start[0]},{start[1]};{end[0]},{end[1]}"
            "?overview=full&geometries=geojson")
     data = _http_json(url)
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise SystemExit(f"OSRM error: {data.get('message', data)}")
     coords = data["routes"][0]["geometry"]["coordinates"]
     return [(c[0], c[1]) for c in coords]
 
@@ -412,24 +440,143 @@ def valhalla_route(start: LonLat, end: LonLat,
     return coords
 
 
-# Profile -> (backend function, costing/profile string passed to it).
+# Profile -> ordered fallback chain of (backend, profile-arg) attempts.
+# We try the most reliable backend first and fall back to alternatives if
+# it errors or times out -- so a single dead public server doesn't block
+# the whole pipeline.
 PROFILES = {
-    "auto":       ("osrm",     "driving"),
-    "pedestrian": ("valhalla", "pedestrian"),
-    "bicycle":    ("valhalla", "bicycle"),
+    "auto":       [("osrm", "driving")],
+    "pedestrian": [("osrm", "foot"), ("valhalla", "pedestrian")],
+    "bicycle":    [("osrm", "bike"), ("valhalla", "bicycle")],
 }
 
 
 def fetch_route(start: LonLat, end: LonLat,
                 profile: str = "auto") -> List[LonLat]:
-    """Route from start to end using the chosen profile."""
+    """Route from start to end using the chosen profile.
+
+    Walks the backend fallback chain for the profile and returns the first
+    successful result. Raises the last error if every backend fails.
+    """
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; "
                          f"choose one of {sorted(PROFILES)}")
-    backend, costing = PROFILES[profile]
-    if backend == "osrm":
-        return osrm_route(start, end)
-    return valhalla_route(start, end, costing=costing)
+    last_err: Exception | None = None
+    for backend, arg in PROFILES[profile]:
+        try:
+            if backend == "osrm":
+                return osrm_route(start, end, profile=arg)
+            return valhalla_route(start, end, costing=arg)
+        except (urllib.error.URLError, TimeoutError, SystemExit) as e:
+            last_err = e
+            continue
+    raise SystemExit(
+        f"All routing backends for profile {profile!r} failed; "
+        f"last error: {last_err}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# GeoJSON export
+# --------------------------------------------------------------------------- #
+
+def to_geojson(result: BeaconResult,
+               raw_coords: Sequence[LonLat],
+               *,
+               name: str | None = None,
+               profile: str | None = None,
+               drift_ft: float | None = None,
+               extra_properties: dict | None = None) -> dict:
+    """Build a GeoJSON FeatureCollection of the route, chord path and beacons.
+
+    The collection is renderable as-is on geojson.io / kepler.gl: the OSM
+    route is a grey LineString, the beacon chord path is a red LineString,
+    each beacon is a small red Point with its sequence index, and the start
+    and end are larger green/blue Points. Properties use the [simplestyle][]
+    spec so geojson.io picks up colors without any manual styling.
+
+    [simplestyle]: https://github.com/mapbox/simplestyle-spec
+    """
+    route_length_ft = sum(haversine_ft(a, b)
+                          for a, b in zip(raw_coords[:-1], raw_coords[1:]))
+    chord_length_ft = sum(haversine_ft(a, b)
+                          for a, b in zip(result.beacons[:-1],
+                                          result.beacons[1:]))
+
+    top_props: dict = {"feature_count": 2 + len(result.beacons)}
+    if name is not None:
+        top_props["name"] = name
+    if profile is not None:
+        top_props["profile"] = profile
+    if drift_ft is not None:
+        top_props["drift_ft"] = round(drift_ft, 2)
+    if extra_properties:
+        top_props.update(extra_properties)
+
+    features: List[dict] = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [list(c) for c in raw_coords],
+            },
+            "properties": {
+                "role": "route",
+                "profile": profile,
+                "length_ft": round(route_length_ft, 1),
+                "stroke": "#888888",
+                "stroke-width": 3,
+                "stroke-opacity": 0.9,
+            },
+        },
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [list(b) for b in result.beacons],
+            },
+            "properties": {
+                "role": "chord_path",
+                "beacon_count": len(result.beacons),
+                "length_ft": round(chord_length_ft, 1),
+                "drift_ft": (None if drift_ft is None
+                             else round(drift_ft, 2)),
+                "stroke": "#d62728",
+                "stroke-width": 2,
+                "stroke-opacity": 0.95,
+            },
+        },
+    ]
+
+    n = len(result.beacons)
+    for i, beacon in enumerate(result.beacons):
+        if i == 0:
+            role, color, size, symbol = "start", "#2ca02c", "large", "a"
+        elif i == n - 1:
+            role, color, size, symbol = "end", "#1f77b4", "large", "b"
+        else:
+            role, color, size, symbol = "beacon", "#d62728", "small", "circle"
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [beacon[0], beacon[1]],
+            },
+            "properties": {
+                "role": role,
+                "index": i,
+                "sequence": f"{i}/{n - 1}",
+                "marker-color": color,
+                "marker-size": size,
+                "marker-symbol": symbol,
+            },
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "properties": top_props,
+        "features": features,
+    }
 
 
 # --------------------------------------------------------------------------- #

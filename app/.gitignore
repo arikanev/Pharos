@@ -1,0 +1,12 @@
+node_modules
+dist
+.DS_Store
+*.log
+.vite
+ios/App/Pods
+ios/App/Podfile.lock
+ios/App/build
+android/.gradle
+android/app/build
+android/build
+android/local.properties

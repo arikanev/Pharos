@@ -3,8 +3,10 @@
 
 Run:
 
-    python examples.py
-    python examples.py --angle 5 --step 15
+    python examples.py                                    # default 8 deg / 20 ft
+    python examples.py --angle 5 --step 15                # tighter manual settings
+    python examples.py --autotune-drift 5                 # autotune each panel
+    python examples.py --autotune-drift 3 --min-spacing 30
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ from typing import Callable, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-from beacon_placement import LonLat, haversine_ft, place_beacons
+from beacon_placement import (LonLat, autotune, haversine_ft,
+                              place_beacons)
 
 
 # All routes are tiny offsets from this anchor so they render as a near-planar
@@ -127,7 +130,10 @@ EXAMPLES: List[Tuple[str, Callable[[], List[LonLat]]]] = [
 # Gallery plot
 # --------------------------------------------------------------------------- #
 
-def gallery(angle_deg: float, step_ft: float, save: str | None = None) -> None:
+def gallery(angle_deg: float, step_ft: float,
+            autotune_drift_ft: float | None = None,
+            min_spacing_ft: float | None = None,
+            save: str | None = None) -> None:
     cols = 3
     rows = (len(EXAMPLES) + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 5.0, rows * 4.2))
@@ -135,9 +141,23 @@ def gallery(angle_deg: float, step_ft: float, save: str | None = None) -> None:
 
     for ax, (name, gen) in zip(axes, EXAMPLES):
         coords = gen()
-        result = place_beacons(coords, angle_deg, step_ft)
         length_ft = sum(haversine_ft(a, b)
                         for a, b in zip(coords[:-1], coords[1:]))
+
+        if autotune_drift_ft is not None:
+            tune = autotune(coords, max_drift_ft=autotune_drift_ft,
+                            step_ft=step_ft, min_spacing_ft=min_spacing_ft)
+            result = tune.result
+            cap = ("none" if tune.max_chord_ft is None
+                   else f"{tune.max_chord_ft:.0f}")
+            ms = ("none" if tune.min_spacing_ft is None
+                  else f"{tune.min_spacing_ft:.0f}")
+            ok = "OK" if tune.drift_ft <= autotune_drift_ft else "OVER"
+            sub = (f"angle={tune.angle_deg:g}\u00b0 cap={cap} ms={ms}  "
+                   f"drift={tune.drift_ft:.1f}ft ({ok})")
+        else:
+            result = place_beacons(coords, angle_deg, step_ft)
+            sub = f"angle={angle_deg:g}\u00b0 step={step_ft:g}ft"
 
         rx, ry = zip(*coords)
         bx, by = zip(*result.beacons)
@@ -153,20 +173,26 @@ def gallery(angle_deg: float, step_ft: float, save: str | None = None) -> None:
         ax.tick_params(labelsize=7)
         ax.set_title(
             f"{name}  \u00b7  {length_ft:,.0f} ft  \u00b7  "
-            f"{len(result.beacons)} beacons",
-            fontsize=10,
+            f"{len(result.beacons)} beacons\n{sub}",
+            fontsize=9,
         )
         ax.legend(loc="best", fontsize=7, framealpha=0.85)
 
     for ax in axes[len(EXAMPLES):]:
         ax.set_visible(False)
 
-    fig.suptitle(
-        f"Beacon placement gallery  \u00b7  angle \u2264 {angle_deg:g}\u00b0"
-        f"  \u00b7  step = {step_ft:g} ft",
-        fontsize=13,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if autotune_drift_ft is not None:
+        suptitle = (f"Autotune gallery  \u00b7  drift \u2264 "
+                    f"{autotune_drift_ft:g} ft  \u00b7  step = {step_ft:g} ft")
+        if min_spacing_ft is not None:
+            suptitle += f"  \u00b7  min_spacing pinned = {min_spacing_ft:g} ft"
+        else:
+            suptitle += "  \u00b7  min_spacing auto-picked per panel"
+    else:
+        suptitle = (f"Beacon placement gallery  \u00b7  angle \u2264 "
+                    f"{angle_deg:g}\u00b0  \u00b7  step = {step_ft:g} ft")
+    fig.suptitle(suptitle, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
 
     if save:
         fig.savefig(save, dpi=120)
@@ -177,13 +203,24 @@ def gallery(angle_deg: float, step_ft: float, save: str | None = None) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Beacon placement example gallery.")
     p.add_argument("--angle", type=float, default=8.0,
-                   help="angle threshold in degrees (default 8)")
+                   help="angle threshold in degrees (default 8); "
+                        "ignored if --autotune-drift is set")
     p.add_argument("--step", type=float, default=20.0,
                    help="resample step in feet (default 20)")
+    p.add_argument("--autotune-drift", type=float, default=None,
+                   metavar="FT",
+                   help="autotune each panel: pick (angle, max_chord, "
+                        "min_spacing) so worst drift <= FT and beacon "
+                        "count is minimized")
+    p.add_argument("--min-spacing", type=float, default=None, metavar="FT",
+                   help="pin min-spacing (otherwise autotune picks per panel)")
     p.add_argument("--save", metavar="PATH",
                    help="optional PNG path to write the gallery to")
     args = p.parse_args()
-    gallery(args.angle, args.step, args.save)
+    gallery(args.angle, args.step,
+            autotune_drift_ft=args.autotune_drift,
+            min_spacing_ft=args.min_spacing,
+            save=args.save)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,131 @@
+# Pharos
+
+Audio beacon navigation for blind and low-vision walkers, built on top of
+the beacon-placement algorithm in
+[`../beacon_placement.py`](../beacon_placement.py) (ported to TypeScript in
+[`src/lib/beacon.ts`](src/lib/beacon.ts), parity-tested against the Python
+reference).
+
+Single Svelte + TypeScript codebase that ships as:
+
+- **Progressive Web App** — instant `npm run dev`, no app store
+- **iOS app** — Capacitor wraps the same web build, gets native
+  CoreLocation + Haptics
+- **Android app** — same build, native FusedLocationProvider + Haptics
+
+Live navigation runs **fully offline** after the trip is fetched and cached
+to IndexedDB.
+
+## Quick start (PWA)
+
+```bash
+npm install
+npm run dev          # http://localhost:5173
+npm run test         # parity tests against Python reference
+npm run build        # production bundle in dist/
+npm run preview      # serve dist/ on the network
+```
+
+Open the dev URL on your phone over the same Wi-Fi (it binds to all
+interfaces). Geolocation needs HTTPS in real browsers; for prototyping use
+a tunnel (`cloudflared`, `ngrok`) or `vite preview --host` behind a
+reverse proxy with TLS.
+
+## Architecture (1 paragraph)
+
+A user gesture on the **Plan** screen geocodes start/end (Nominatim),
+fetches a pedestrian polyline (FOSSGIS OSRM-foot, Valhalla fallback),
+runs the autotune to pick `(angle, max_chord, min_spacing)` for the chosen
+drift budget, and saves the resulting beacons to IndexedDB. The
+**Navigate** screen then opens an `AudioContext`, requests compass +
+location permissions, watches GPS, and on every fix updates a Web Audio
+`PannerNode` (panningModel `"HRTF"`) so the looping tone localizes toward
+the next beacon. When the user is within 15 ft of a beacon a chime plays
+and the engine advances. All numeric audio updates are smoothed with
+`setTargetAtTime` so frequent ticks don't pop.
+
+## Native builds
+
+### Android
+
+Already scaffolded into [`android/`](android/) by `npx cap add android`
+during initial setup.
+
+```bash
+npm run build
+npx cap sync android
+npx cap open android      # opens Android Studio
+```
+
+In Android Studio, hit **Run** with a connected device or emulator. The
+location, vibration, and wake-lock permissions are declared in
+[`android/app/src/main/AndroidManifest.xml`](android/app/src/main/AndroidManifest.xml).
+
+### iOS
+
+You need Xcode + CocoaPods first:
+
+```bash
+brew install cocoapods   # one-time
+npx cap add ios          # scaffolds ios/ (only run once)
+npm run build
+npx cap sync ios
+npx cap open ios         # opens Xcode
+```
+
+Add the following keys to `ios/App/App/Info.plist` (Capacitor will inject
+boilerplate but you must add the user-facing usage strings):
+
+```xml
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Pharos uses your location to guide you along your route.</string>
+<key>NSMotionUsageDescription</key>
+<string>Pharos uses the compass to pan audio toward the next beacon.</string>
+```
+
+Build for a device (Simulator does not produce real GPS or compass data).
+
+## Project map
+
+```
+src/
+  main.ts                 bootstrap
+  App.svelte              2-screen router + global aria-live region
+  Plan.svelte             Plan-a-trip UI
+  Navigate.svelte         Live navigation UI
+  lib/
+    beacon.ts             TS port of beacon_placement.py
+    routing.ts            OSRM-foot + Valhalla fallback chain client
+    audio.ts              HRTF panner + continuous/rhythmic modes
+    sensors.ts            GPS watch + compass/course heading fusion
+    a11y.ts               speech, haptics, wake lock, live announcements
+    storage.ts            IndexedDB current-trip cache
+  assets/
+    README.md             notes on synthesized audio + how to swap in
+                          Soundscape's original WAVs
+test/
+  parity.test.ts          asserts TS == Python on every central_park_*.geojson
+```
+
+## Tuning the beacons
+
+The Plan screen exposes a **drift slider** (1–25 ft, default 5). Lower
+drift puts more beacons closer together so the chord path hugs the OSM
+polyline more tightly. 5 ft sits just inside typical civilian-GPS noise
+and is a good default; 1 ft roughly doubles the beacon count.
+
+The autotune internally Pareto-optimizes over `(angle, max_chord,
+min_spacing)`; tie-breakers prefer fewer beacons (less audio cognitive
+load) and larger min-spacing (fewer "are we there yet?" transitions). See
+[`../README.md`](../README.md) for the full algorithm description.
+
+## Known limitations / out of scope
+
+- No accounts or saved routes (single-trip MVP).
+- No POI / obstacle callouts (Soundscape's bigger feature set).
+- Routing uses public FOSSGIS OSRM endpoints — fine for prototyping but
+  no SLA. Swap `lib/routing.ts` for a paid provider for production.
+- iOS DeviceOrientation permission must be requested from a user gesture
+  inside `Navigate.svelte`'s **Start** handler — already wired up.
+- Synthesized beacon tones, not Soundscape's audio assets. To use the
+  originals, see [`src/assets/README.md`](src/assets/README.md).
