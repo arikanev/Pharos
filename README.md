@@ -70,12 +70,12 @@ location, vibration, and wake-lock permissions are declared in
 You need Xcode + CocoaPods first:
 
 ```bash
-sudo gem install cocoapods   # one-time; uses macOS system Ruby
+brew install cocoapods   # one-time
 cd app
-npx cap add ios              # scaffolds app/ios/ (only run once)
+npx cap add ios          # scaffolds app/ios/ (only run once)
 npm run build
 npx cap sync ios
-npx cap open ios             # opens Xcode
+npx cap open ios         # opens Xcode
 ```
 
 Add the following keys to `app/ios/App/App/Info.plist` (Capacitor will
