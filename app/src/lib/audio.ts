@@ -1,25 +1,38 @@
 /**
- * HRTF-spatialized audio guidance engine.
+ * Spatial audio guidance engine.
  *
- * Architecture mirrors Soundscape's BeaconAudioEngine, swapping
- * AVAudio3DMixing for Web Audio API's PannerNode (panningModel = "HRTF").
+ *     [ToneBuffer] -> [Source] -> [Panner] -> [DistGain] -> [Gate] -> [Master] -> dest
+ *                                    ^           ^           ^
+ *                                    |           |           |
+ *                              lateral cue    distance     on/off-axis
+ *                                          attenuation    envelope
  *
- *     [ToneBuffer] -> [Source] -> [Panner HRTF] -> [Gate] -> [Master] -> dest
- *                                       ^             ^
- *                                       |             |
- *                                  beacon pos    on/off-axis envelope
+ * Two panner implementations are runtime-swappable for A/B testing:
  *
- *   AudioListener.position = (0,0,0)   (user's local origin)
- *   AudioListener.forward  = heading-derived unit vector
- *   PannerNode.position    = (east_m, 0, -north_m)  beacon offset in metres
+ *   - "stereo" (default): StereoPannerNode. Hard left/right pan via
+ *     constant-power pan law. Audible on phone speakers and headphones,
+ *     no inter-aural cues so front/back are disambiguated only by the
+ *     alignment-driven gate gain (loud = facing it, quiet = behind).
+ *
+ *   - "hrtf": PannerNode with panningModel = "HRTF". Full 3D binaural
+ *     spatialization via head-related transfer function; positions the
+ *     beacon in space and rotates the listener with the user's heading.
+ *     Subtle on phone speakers (inter-aural delay needs >~12 cm spacing
+ *     to register), more present on headphones. Front/back disambiguated
+ *     by HRTF spectral cues.
+ *
+ * Distance attenuation is always done by the dedicated DistGain stage so
+ * the two modes are otherwise apples-to-apples.
  *
  * All numeric updates are smoothed with `setTargetAtTime` over ~150 ms so
  * frequent location/heading ticks don't pop or zip.
  *
  * Two modes:
  *   - "continuous" (default): always-on tone, gain modulated by alignment.
- *   - "rhythmic"  : same tone gated on/off; period shrinks as you face
- *                   directly at the beacon.
+ *   - "rhythmic"  : tone gated into pulses; period shrinks as you face
+ *                   directly at the beacon, and within ~14 deg of on-axis
+ *                   the gate stays fully open (continuous tone) so the
+ *                   user has an unambiguous "you're facing it" cue.
  */
 
 import type { LonLat } from "./beacon";
@@ -27,22 +40,31 @@ import { bearingDeg } from "./beacon";
 
 const SMOOTH_TC = 0.15;          // seconds, AudioParam setTargetAtTime time const
 
-// Conservative perceptual range (metres) for HRTF distance attenuation. We
-// don't want the source to vanish when the user is 200 m from the beacon.
-const REF_DISTANCE_M = 5;
-const ROLLOFF_FACTOR = 0.6;
+// Distance attenuation. Gentler than the previous HRTF panner's inverse
+// model so a beacon 50-100 m away is still clearly audible.
+const REF_DIST_M = 20;
+const DIST_ROLLOFF = 0.3;
+const DIST_GAIN_FLOOR = 0.4;
+
+// At >= this alignment (cos of off-axis angle) the rhythmic gate stops
+// pulsing and holds open: the user gets a continuous tone meaning "you
+// are facing the beacon". 0.97 ~= within 14 deg of dead-on.
+const ALIGN_CONTINUOUS_THRESHOLD = 0.97;
 
 export type AudioMode = "continuous" | "rhythmic";
+export type PanMode = "stereo" | "hrtf";
 
 export interface AudioEngineOptions {
   mode?: AudioMode;
+  panMode?: PanMode;
   masterGain?: number;
 }
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
   private master: GainNode | null = null;
-  private panner: PannerNode | null = null;
+  private panner: StereoPannerNode | PannerNode | null = null;
+  private distanceGain: GainNode | null = null;
   private gate: GainNode | null = null;        // alignment / rhythm gate
   private toneSrc: AudioBufferSourceNode | null = null;
   private toneBuf: AudioBuffer | null = null;
@@ -50,14 +72,19 @@ export class AudioEngine {
   private finalBuf: AudioBuffer | null = null;
 
   private mode: AudioMode;
+  private panMode: PanMode;
   private gateMasterGain = 1;
   private rhythmTimer: number | null = null;
   private alignment = 0;       // 0 = pointing wrong way, 1 = on-axis
+  private lastPos: LonLat | null = null;
+  private lastBeacon: LonLat | null = null;
+  private lastHeading = 0;
   private running = false;
 
   constructor(opts: AudioEngineOptions = {}) {
     this.mode = opts.mode ?? "continuous";
-    this.gateMasterGain = opts.masterGain ?? 0.6;
+    this.panMode = opts.panMode ?? "stereo";
+    this.gateMasterGain = opts.masterGain ?? 0.85;
   }
 
   /** Lazy-initialize the AudioContext. MUST be called from a user gesture. */
@@ -69,7 +96,7 @@ export class AudioEngine {
     this.ctx = new Ctor();
     if (this.ctx.state === "suspended") await this.ctx.resume();
 
-    // Node graph
+    // Node graph: source -> stereo pan -> distance gain -> gate -> master -> dest
     this.master = this.ctx.createGain();
     this.master.gain.value = this.gateMasterGain;
     this.master.connect(this.ctx.destination);
@@ -78,13 +105,12 @@ export class AudioEngine {
     this.gate.gain.value = 0;        // start silent until start()
     this.gate.connect(this.master);
 
-    this.panner = this.ctx.createPanner();
-    this.panner.panningModel = "HRTF";
-    this.panner.distanceModel = "inverse";
-    this.panner.refDistance = REF_DISTANCE_M;
-    this.panner.rolloffFactor = ROLLOFF_FACTOR;
-    this.panner.maxDistance = 10_000;
-    this.panner.connect(this.gate);
+    this.distanceGain = this.ctx.createGain();
+    this.distanceGain.gain.value = 1;
+    this.distanceGain.connect(this.gate);
+
+    this.panner = this.createPanner(this.panMode);
+    this.panner.connect(this.distanceGain);
 
     // Synthesize buffers up front (cheap, all <1s).
     const sr = this.ctx.sampleRate;
@@ -108,64 +134,80 @@ export class AudioEngine {
 
   /** Update the user's GPS position and compass heading (deg from north). */
   setUserPose(userPos: LonLat, beaconPos: LonLat, headingDeg: number): void {
-    if (!this.ctx || !this.panner) return;
+    if (!this.ctx || !this.panner || !this.distanceGain) return;
 
-    // Convert beacon offset to local east/north metres.
-    const lat0 = (userPos[1] * Math.PI) / 180;
-    const eastM =
-      ((beaconPos[0] - userPos[0]) * Math.PI / 180) *
-      6_378_137 *
-      Math.cos(lat0);
-    const northM =
-      ((beaconPos[1] - userPos[1]) * Math.PI / 180) * 6_378_137;
+    this.lastPos = userPos;
+    this.lastBeacon = beaconPos;
+    this.lastHeading = headingDeg;
 
     const t = this.ctx.currentTime;
-    setSmooth(this.panner.positionX, eastM, t);
-    setSmooth(this.panner.positionY, 0, t);
-    setSmooth(this.panner.positionZ, -northM, t);
 
-    // Listener stays at origin; orientation tracks heading.
-    const headingRad = (headingDeg * Math.PI) / 180;
-    const fx = Math.sin(headingRad);
-    const fz = -Math.cos(headingRad);
-    const lis = this.ctx.listener;
-    if ("forwardX" in lis) {
-      setSmooth(lis.positionX, 0, t);
-      setSmooth(lis.positionY, 0, t);
-      setSmooth(lis.positionZ, 0, t);
-      setSmooth(lis.forwardX, fx, t);
-      setSmooth(lis.forwardY, 0, t);
-      setSmooth(lis.forwardZ, fz, t);
-      setSmooth(lis.upX, 0, t);
-      setSmooth(lis.upY, 1, t);
-      setSmooth(lis.upZ, 0, t);
-    } else {
-      // Legacy Safari fallback.
-      const legacy = lis as unknown as {
-        setPosition: (x: number, y: number, z: number) => void;
-        setOrientation: (
-          fx: number,
-          fy: number,
-          fz: number,
-          ux: number,
-          uy: number,
-          uz: number,
-        ) => void;
-      };
-      legacy.setPosition(0, 0, 0);
-      legacy.setOrientation(fx, 0, fz, 0, 1, 0);
-    }
-
-    // Compute alignment: how directly the user faces the beacon. The HRTF
-    // panner already gives binaural cues, but blindfolded testing showed
-    // amplitude modulation by alignment is the strongest "you're facing
-    // it" signal for non-trained listeners. cos(off) maps 0deg -> +1,
-    // 180deg -> -1; clamp to [0, 1] and bias floor to 0.25 so the source
-    // never disappears.
+    // Off-axis angle in radians: 0 = beacon dead ahead, +pi/2 = beacon
+    // directly to the user's right, -pi/2 = directly to the left, +/-pi
+    // = directly behind.
     const beaconBearing = bearingDeg(userPos, beaconPos);
     const off = ((beaconBearing - headingDeg + 540) % 360) - 180;
-    const dot = Math.cos((off * Math.PI) / 180);
-    this.alignment = Math.max(0, dot);
+    const offRad = (off * Math.PI) / 180;
+
+    const lat0 = (userPos[1] * Math.PI) / 180;
+    const eastM =
+      ((beaconPos[0] - userPos[0]) * Math.PI / 180) * 6_378_137 * Math.cos(lat0);
+    const northM = ((beaconPos[1] - userPos[1]) * Math.PI / 180) * 6_378_137;
+
+    if (this.panner instanceof StereoPannerNode) {
+      // Stereo pan: sin(off) maps front/back to 0 and the sides to +/-1.
+      // Front and back collide on the pan axis but the alignment-driven
+      // gate gain (cos(off), below) disambiguates them by volume.
+      setSmooth(this.panner.pan, Math.sin(offRad), t);
+    } else {
+      // HRTF: place beacon in 3D listener space, rotate listener with
+      // user's heading. Distance attenuation is handled by distanceGain
+      // (the panner has rolloffFactor = 0).
+      const hrtf = this.panner;
+      setSmooth(hrtf.positionX, eastM, t);
+      setSmooth(hrtf.positionY, 0, t);
+      setSmooth(hrtf.positionZ, -northM, t);
+
+      const headingRad = (headingDeg * Math.PI) / 180;
+      const fx = Math.sin(headingRad);
+      const fz = -Math.cos(headingRad);
+      const lis = this.ctx.listener;
+      if ("forwardX" in lis) {
+        setSmooth(lis.positionX, 0, t);
+        setSmooth(lis.positionY, 0, t);
+        setSmooth(lis.positionZ, 0, t);
+        setSmooth(lis.forwardX, fx, t);
+        setSmooth(lis.forwardY, 0, t);
+        setSmooth(lis.forwardZ, fz, t);
+        setSmooth(lis.upX, 0, t);
+        setSmooth(lis.upY, 1, t);
+        setSmooth(lis.upZ, 0, t);
+      } else {
+        const legacy = lis as unknown as {
+          setPosition: (x: number, y: number, z: number) => void;
+          setOrientation: (
+            fx: number, fy: number, fz: number,
+            ux: number, uy: number, uz: number,
+          ) => void;
+        };
+        legacy.setPosition(0, 0, 0);
+        legacy.setOrientation(fx, 0, fz, 0, 1, 0);
+      }
+    }
+
+    // Distance attenuation: gentle inverse curve so a 50-100 m beacon
+    // stays clearly audible; floors out past ~300 m.
+    const distM = Math.hypot(eastM, northM);
+    const dg = Math.max(
+      DIST_GAIN_FLOOR,
+      REF_DIST_M / (REF_DIST_M + DIST_ROLLOFF * Math.max(0, distM - REF_DIST_M)),
+    );
+    setSmooth(this.distanceGain.gain, dg, t);
+
+    // Alignment in [0, 1]: 1 = facing the beacon, 0 = facing exactly
+    // away. Drives the gate (continuous mode volume, rhythmic mode
+    // pulse rate).
+    this.alignment = Math.max(0, Math.cos(offRad));
     this.applyAlignment(this.alignment);
   }
 
@@ -175,6 +217,44 @@ export class AudioEngine {
     this.mode = mode;
     this.stopRhythmScheduler();
     this.applyAlignment(this.alignment);
+  }
+
+  /** Switch between stereo and HRTF panning. Hot-swaps the panner node. */
+  setPanMode(mode: PanMode): void {
+    if (this.panMode === mode) return;
+    this.panMode = mode;
+    if (!this.ctx || !this.distanceGain) return;
+
+    if (this.toneSrc) {
+      try { this.toneSrc.disconnect(); } catch { /* not connected */ }
+    }
+    if (this.panner) {
+      try { this.panner.disconnect(); } catch { /* not connected */ }
+    }
+    this.panner = this.createPanner(mode);
+    this.panner.connect(this.distanceGain);
+    if (this.toneSrc && this.running) {
+      this.toneSrc.connect(this.panner);
+    }
+    if (this.lastPos && this.lastBeacon) {
+      this.setUserPose(this.lastPos, this.lastBeacon, this.lastHeading);
+    }
+  }
+
+  private createPanner(mode: PanMode): StereoPannerNode | PannerNode {
+    if (!this.ctx) throw new Error("AudioContext not initialised");
+    if (mode === "hrtf") {
+      const p = this.ctx.createPanner();
+      p.panningModel = "HRTF";
+      p.distanceModel = "inverse";
+      p.refDistance = 1;
+      p.rolloffFactor = 0;     // distance handled by distanceGain stage
+      p.maxDistance = 10_000;
+      return p;
+    }
+    const p = this.ctx.createStereoPanner();
+    p.pan.value = 0;
+    return p;
   }
 
   /** Play the per-beacon arrival chime. */
@@ -217,9 +297,15 @@ export class AudioEngine {
       // because we're driving the *envelope*, not the spectral content.
       const target = 0.25 + 0.75 * a;
       setSmooth(this.gate.gain, target, t, SMOOTH_TC);
+    } else if (a >= ALIGN_CONTINUOUS_THRESHOLD) {
+      // Inside the on-axis cone: drop the pulses and hold the gate open
+      // so the user hears an unbroken tone -- the "you're facing it" cue.
+      this.stopRhythmScheduler();
+      this.gate.gain.cancelScheduledValues(t);
+      setSmooth(this.gate.gain, 1, t, SMOOTH_TC);
     } else {
-      // Rhythmic: full amplitude when gated open, but the period (and pulse
-      // shape) shrinks as alignment grows. Ensure a scheduler is running.
+      // Off-axis: pulse rate scales with alignment. Make sure a scheduler
+      // is running.
       this.ensureRhythmScheduler();
     }
   }
@@ -230,10 +316,21 @@ export class AudioEngine {
       if (!this.ctx || !this.gate || !this.running || this.mode !== "rhythmic") {
         return;
       }
-      // Period: 1200 ms at off-axis -> 320 ms when fully aligned.
-      const period = 1.2 - 0.88 * this.alignment;
-      // Pulse width: 60 ms (sharp blip) off-axis -> 150 ms (sustained) on-axis.
-      const pulse = 0.06 + 0.09 * this.alignment;
+      // If we've slipped into the on-axis cone since the last tick, hand
+      // off to applyAlignment which will hold the gate open.
+      if (this.alignment >= ALIGN_CONTINUOUS_THRESHOLD) {
+        this.rhythmTimer = null;
+        this.applyAlignment(this.alignment);
+        return;
+      }
+      // Period: 1000 ms at off-axis -> 180 ms just below the continuous
+      // threshold. Curve is non-linear so the speed-up accelerates as
+      // the user gets close to dead-on.
+      const a = this.alignment;
+      const period = 1.0 - 0.82 * Math.pow(a, 0.6);
+      // Pulse width grows with alignment so the duty cycle visibly
+      // climbs toward "always on" before flipping fully continuous.
+      const pulse = 0.06 + 0.18 * a;
       const t0 = this.ctx.currentTime + 0.01;
       const g = this.gate.gain;
       g.cancelScheduledValues(t0);
@@ -280,9 +377,9 @@ function setSmooth(
 
 function makeToneBuffer(_ctx: AudioContext, sr: number): AudioBuffer {
   // 2-second loop: two detuned partials (440 Hz + 442 Hz) plus a slow tremolo
-  // at 3 Hz. The detuning gives a subtle, non-headache-inducing chorus that
-  // localizes well in HRTF; the tremolo provides a slow rhythmic anchor that
-  // makes "is the audio moving across my head?" easy to detect.
+  // at 3 Hz. The detuning gives a subtle, non-headache-inducing chorus; the
+  // tremolo provides a slow rhythmic anchor that makes "is the audio
+  // moving across my head?" easy to detect.
   const dur = 2.0;
   const n = Math.floor(dur * sr);
   const buf = new AudioBuffer({ numberOfChannels: 1, length: n, sampleRate: sr });

@@ -1,19 +1,28 @@
 <script lang="ts">
+  import { Geolocation } from "@capacitor/geolocation";
+
   import { autotune, polylineLengthFt, type LonLat } from "./lib/beacon";
   import { fetchRoute, geocode, type GeocodeResult } from "./lib/routing";
-  import { saveCurrentTrip } from "./lib/storage";
+  import { saveCurrentTrip, type Trip } from "./lib/storage";
   import { announce } from "./lib/a11y";
+  import PickPointMap from "./PickPointMap.svelte";
 
-  type Mode = "search" | "coords";
+  type StartMode = "search" | "coords" | "current";
+  type EndMode = "search" | "coords" | "map";
+
+  interface CurrentLoc {
+    pos: LonLat;
+    accuracyM: number;
+  }
 
   interface Props {
-    onPlanned: () => void;
+    onPlanned: (trip: Trip) => void;
   }
 
   let { onPlanned }: Props = $props();
 
-  let startMode = $state<Mode>("search");
-  let endMode = $state<Mode>("search");
+  let startMode = $state<StartMode>("search");
+  let endMode = $state<EndMode>("search");
 
   let startQuery = $state("");
   let endQuery = $state("");
@@ -25,10 +34,14 @@
   let startSel = $state<GeocodeResult | null>(null);
   let endSel = $state<GeocodeResult | null>(null);
 
+  let currentLoc = $state<CurrentLoc | null>(null);
+  let endMapPos = $state<LonLat | null>(null);
+
   let driftFt = $state(5);
   let stepFt = $state(20);
 
   let busy = $state(false);
+  let locBusy = $state(false);
   let error = $state<string | null>(null);
   let summary = $state<string | null>(null);
 
@@ -47,6 +60,14 @@
       const p = parseCoords(startCoordsText);
       return p ? { pos: p, label: startCoordsText } : null;
     }
+    if (startMode === "current") {
+      return currentLoc
+        ? {
+            pos: currentLoc.pos,
+            label: `Current location (\u00b1${Math.round(currentLoc.accuracyM)} m)`,
+          }
+        : null;
+    }
     return startSel ? { pos: startSel.position, label: startSel.display } : null;
   }
 
@@ -55,7 +76,49 @@
       const p = parseCoords(endCoordsText);
       return p ? { pos: p, label: endCoordsText } : null;
     }
+    if (endMode === "map") {
+      return endMapPos
+        ? {
+            pos: endMapPos,
+            label: `Map: ${endMapPos[1].toFixed(5)}, ${endMapPos[0].toFixed(5)}`,
+          }
+        : null;
+    }
     return endSel ? { pos: endSel.position, label: endSel.display } : null;
+  }
+
+  async function useCurrentLocation() {
+    locBusy = true;
+    error = null;
+    try {
+      const perm = await Geolocation.checkPermissions();
+      if (perm.location !== "granted") {
+        const r = await Geolocation.requestPermissions();
+        if (r.location !== "granted") {
+          throw new Error("Location permission denied");
+        }
+      }
+      const pos = await Geolocation.getCurrentPosition({
+        enableHighAccuracy: true,
+        timeout: 10_000,
+        maximumAge: 0,
+      });
+      currentLoc = {
+        pos: [pos.coords.longitude, pos.coords.latitude],
+        accuracyM: pos.coords.accuracy ?? Number.NaN,
+      };
+      announce(
+        `Current location acquired, accuracy ${
+          Number.isFinite(currentLoc.accuracyM)
+            ? Math.round(currentLoc.accuracyM) + " metres"
+            : "unknown"
+        }.`,
+      );
+    } catch (e) {
+      error = `Could not get location: ${(e as Error).message}`;
+    } finally {
+      locBusy = false;
+    }
   }
 
   async function searchStart() {
@@ -101,7 +164,7 @@
       const route = await fetchRoute(s.pos, e.pos, "pedestrian");
       const tune = autotune(route.coords, driftFt, { stepFt });
       const lengthFt = polylineLengthFt(route.coords);
-      const trip = {
+      const trip: Trip = {
         savedAt: Date.now(),
         start: s.pos,
         end: e.pos,
@@ -113,8 +176,8 @@
       };
       await saveCurrentTrip(trip);
       summary = `${tune.beaconCount} beacons over ${Math.round(lengthFt).toLocaleString()} ft. Worst drift ${tune.driftFt.toFixed(1)} ft.`;
-      announce(`Route ready. ${summary} Press Start to begin.`, { interrupt: true });
-      onPlanned();
+      announce(`Route ready. ${summary} Starting navigation.`, { interrupt: true });
+      onPlanned(trip);
     } catch (err) {
       error = `Routing failed: ${(err as Error).message}`;
       announce(`Routing failed: ${(err as Error).message}`, { interrupt: true });
@@ -134,7 +197,9 @@
       <button type="button" role="tab" aria-selected={startMode === "search"}
               onclick={() => (startMode = "search")}>Search</button>
       <button type="button" role="tab" aria-selected={startMode === "coords"}
-              onclick={() => (startMode = "coords")}>Coordinates</button>
+              onclick={() => (startMode = "coords")}>Coords</button>
+      <button type="button" role="tab" aria-selected={startMode === "current"}
+              onclick={() => (startMode = "current")}>Current</button>
     </div>
     {#if startMode === "search"}
       <label for="start-q">Address or place</label>
@@ -155,10 +220,27 @@
           {/each}
         </ul>
       {/if}
-    {:else}
+    {:else if startMode === "coords"}
       <label for="start-c">Start coordinates (lon,lat or lat,lon)</label>
       <input id="start-c" type="text" inputmode="decimal" placeholder="-73.97, 40.77"
              bind:value={startCoordsText} />
+    {:else}
+      <button type="button" onclick={useCurrentLocation} disabled={locBusy}>
+        {locBusy ? "Getting GPS fix..." : currentLoc ? "Refresh current location" : "Use current location"}
+      </button>
+      {#if currentLoc}
+        <p class="ok small">
+          {currentLoc.pos[1].toFixed(5)}, {currentLoc.pos[0].toFixed(5)}
+          {#if Number.isFinite(currentLoc.accuracyM)}
+            (&plusmn;{Math.round(currentLoc.accuracyM)} m)
+          {/if}
+        </p>
+      {:else}
+        <p class="muted small">
+          Grabs a one-shot GPS fix. iOS / Android will prompt for location
+          permission the first time.
+        </p>
+      {/if}
     {/if}
   </fieldset>
 
@@ -168,7 +250,9 @@
       <button type="button" role="tab" aria-selected={endMode === "search"}
               onclick={() => (endMode = "search")}>Search</button>
       <button type="button" role="tab" aria-selected={endMode === "coords"}
-              onclick={() => (endMode = "coords")}>Coordinates</button>
+              onclick={() => (endMode = "coords")}>Coords</button>
+      <button type="button" role="tab" aria-selected={endMode === "map"}
+              onclick={() => (endMode = "map")}>Map</button>
     </div>
     {#if endMode === "search"}
       <label for="end-q">Address or place</label>
@@ -187,10 +271,22 @@
           {/each}
         </ul>
       {/if}
-    {:else}
+    {:else if endMode === "coords"}
       <label for="end-c">Destination coordinates (lon,lat or lat,lon)</label>
       <input id="end-c" type="text" inputmode="decimal" placeholder="-73.96, 40.78"
              bind:value={endCoordsText} />
+    {:else}
+      <p class="muted small">Tap the map to drop a destination pin.</p>
+      <PickPointMap
+        initialCenter={endMapPos ?? currentLoc?.pos ?? null}
+        picked={endMapPos}
+        onPick={(p) => (endMapPos = p)}
+      />
+      {#if endMapPos}
+        <p class="ok small">
+          Destination: {endMapPos[1].toFixed(5)}, {endMapPos[0].toFixed(5)}
+        </p>
+      {/if}
     {/if}
   </fieldset>
 

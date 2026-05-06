@@ -6,7 +6,7 @@
     haversineFt,
     type LonLat,
   } from "./lib/beacon";
-  import { AudioEngine, type AudioMode } from "./lib/audio";
+  import { AudioEngine, type AudioMode, type PanMode } from "./lib/audio";
   import {
     requestOrientationPermission,
     startSensors,
@@ -20,39 +20,51 @@
     finalHaptic,
     releaseWakeLock,
   } from "./lib/a11y";
-  import { loadCurrentTrip, type Trip } from "./lib/storage";
+  import type { Trip } from "./lib/storage";
+  import RouteMap from "./RouteMap.svelte";
 
   interface Props {
+    trip: Trip | null;
     onExit: () => void;
   }
 
-  let { onExit }: Props = $props();
+  let { trip, onExit }: Props = $props();
 
   // Distance threshold to count a beacon as "arrived". 15 ft is a hair below
   // typical civilian GPS HDOP, so the trigger lands once the user is within
   // the noise floor of being there.
   const ARRIVAL_RADIUS_FT = 15;
 
-  let trip = $state<Trip | null>(null);
   let beaconIdx = $state(0);
-  let totalBeacons = $state(0);
   let distanceFt = $state<number | null>(null);
   let bearingDiff = $state<number | null>(null);
   let position = $state<PositionFix | null>(null);
   let heading = $state<HeadingFix | null>(null);
   let mode = $state<AudioMode>("continuous");
+  let panMode = $state<PanMode>("stereo");
   let running = $state(false);
   let error = $state<string | null>(null);
   let arrived = $state(false);
+
+  const totalBeacons = $derived(trip?.tune.result.beacons.length ?? 0);
 
   let engine: AudioEngine | null = null;
   let unsubPos: (() => void) | null = null;
   let unsubHeading: (() => void) | null = null;
   let stopSensors: (() => Promise<void>) | null = null;
+  let autoStarted = $state(false);
 
-  void loadCurrentTrip().then((t) => {
-    trip = t;
-    if (t) totalBeacons = t.tune.result.beacons.length;
+  // Auto-start navigation as soon as a trip is available. The plan() flow
+  // in Plan.svelte ran inside a user gesture, and Navigate mounts inside
+  // that same call stack, so iOS WKWebView typically still has user
+  // activation here. If the AudioContext or DeviceOrientation prompt
+  // can't acquire a gesture, start() surfaces an error and the Retry
+  // button below covers that case.
+  $effect(() => {
+    if (trip && !autoStarted && !running && !arrived) {
+      autoStarted = true;
+      void start();
+    }
   });
 
   function nextBeacon(): LonLat | null {
@@ -100,7 +112,7 @@
       await requestOrientationPermission();
 
       // 2. Audio context (also requires user gesture).
-      engine = new AudioEngine({ mode });
+      engine = new AudioEngine({ mode, panMode });
       await engine.init();
 
       // 3. Sensors.
@@ -157,6 +169,14 @@
     });
   }
 
+  function changePanMode(p: PanMode): void {
+    panMode = p;
+    engine?.setPanMode(p);
+    announce(p === "stereo" ? "Stereo panning." : "HRTF spatial panning.", {
+      dedupeMs: 500,
+    });
+  }
+
   onDestroy(() => { void stop(); });
 
   function fmtBearing(diff: number | null): string {
@@ -179,14 +199,29 @@
       {trip.startLabel ?? "Start"} <span aria-hidden="true">→</span> {trip.endLabel ?? "End"}
     </p>
 
+    <RouteMap
+      routeCoords={trip.route.coords}
+      beacons={trip.tune.result.beacons}
+      nextBeaconIdx={beaconIdx}
+      userPos={position?.position ?? null}
+      accuracyM={position?.accuracyM ?? null}
+      arrivalRadiusFt={ARRIVAL_RADIUS_FT}
+    />
+
     {#if !running && !arrived}
-      <button type="button" class="primary big" onclick={start}>
-        Start navigation
-      </button>
-      <p class="muted small">
-        Press Start to begin GPS tracking and audio guidance.
-        You'll hear a tone that gets centred in your ears as you face the next beacon.
-      </p>
+      {#if error}
+        <p class="muted">Navigation could not start.</p>
+        <button type="button" class="primary big" onclick={() => void start()}>
+          Retry
+        </button>
+      {:else if autoStarted}
+        <p class="muted">Navigation paused.</p>
+        <button type="button" class="primary big" onclick={() => void start()}>
+          Resume
+        </button>
+      {:else}
+        <p class="muted">Starting navigation...</p>
+      {/if}
     {:else if running}
       <div class="status-grid" role="group" aria-label="Navigation status">
         <div class="cell">
@@ -231,6 +266,16 @@
                 onclick={() => changeMode("rhythmic")}>Rhythmic</button>
       </fieldset>
 
+      <fieldset class="mode-switch">
+        <legend>Spatial</legend>
+        <button type="button" class:selected={panMode === "stereo"}
+                aria-pressed={panMode === "stereo"}
+                onclick={() => changePanMode("stereo")}>Stereo</button>
+        <button type="button" class:selected={panMode === "hrtf"}
+                aria-pressed={panMode === "hrtf"}
+                onclick={() => changePanMode("hrtf")}>HRTF</button>
+      </fieldset>
+
       <button type="button" class="danger big" onclick={stop}>Stop</button>
     {:else}
       <p class="ok big">Arrived.</p>
@@ -253,7 +298,6 @@
   h1 { font-size: 1.5rem; margin: 0; }
   .route { font-size: 1.05rem; }
   .muted { color: #777; }
-  .small { font-size: 0.85rem; }
   .ok { color: #1a6; font-weight: 700; }
   .big { font-size: 1.15rem; min-height: 4rem; }
   .error { color: #c33; }

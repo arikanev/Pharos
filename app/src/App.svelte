@@ -2,13 +2,21 @@
   import Plan from "./Plan.svelte";
   import Navigate from "./Navigate.svelte";
   import { liveAnnouncement } from "./lib/a11y";
+  import { loadCurrentTrip, type Trip } from "./lib/storage";
 
   type Screen = "plan" | "navigate";
 
   let screen = $state<Screen>("plan");
+  let trip = $state<Trip | null>(null);
   let live = $state("");
 
   liveAnnouncement.subscribe((m) => (live = m));
+
+  // Cold-boot: rehydrate the last cached trip so users returning to the app
+  // see it on the Navigate tab.
+  void loadCurrentTrip().then((t) => {
+    if (t && !trip) trip = t;
+  });
 </script>
 
 <main>
@@ -20,9 +28,9 @@
   </nav>
 
   {#if screen === "plan"}
-    <Plan onPlanned={() => (screen = "navigate")} />
+    <Plan onPlanned={(t) => { trip = t; screen = "navigate"; }} />
   {:else}
-    <Navigate onExit={() => (screen = "plan")} />
+    <Navigate {trip} onExit={() => (screen = "plan")} />
   {/if}
 
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">
