@@ -3,6 +3,7 @@
 
   import { autotune, polylineLengthFt, type LonLat } from "./lib/beacon";
   import { fetchRoute, geocode, type GeocodeResult } from "./lib/routing";
+  import { fetchCrossings } from "./lib/crossings";
   import { saveCurrentTrip, type Trip } from "./lib/storage";
   import { announce } from "./lib/a11y";
   import PickPointMap from "./PickPointMap.svelte";
@@ -162,7 +163,12 @@
     announce("Planning route.", { interrupt: true });
     try {
       const route = await fetchRoute(s.pos, e.pos, "pedestrian");
-      const tune = autotune(route.coords, driftFt, { stepFt });
+      // Run beacon placement and the OSM crossing query in parallel; the
+      // crossing fetch is best-effort and never blocks routing.
+      const [tune, crossings] = await Promise.all([
+        Promise.resolve(autotune(route.coords, driftFt, { stepFt })),
+        fetchCrossings(route.coords).catch(() => []),
+      ]);
       const lengthFt = polylineLengthFt(route.coords);
       const trip: Trip = {
         savedAt: Date.now(),
@@ -173,10 +179,19 @@
         driftBudgetFt: driftFt,
         route,
         tune,
+        crossings,
       };
       await saveCurrentTrip(trip);
-      summary = `${tune.beaconCount} beacons over ${Math.round(lengthFt).toLocaleString()} ft. Worst drift ${tune.driftFt.toFixed(1)} ft.`;
-      announce(`Route ready. ${summary} Starting navigation.`, { interrupt: true });
+      const crossingSummary =
+        crossings.length === 1
+          ? "1 street crossing"
+          : `${crossings.length} street crossings`;
+      summary = `${tune.beaconCount} beacons over ${Math.round(lengthFt).toLocaleString()} ft. Worst drift ${tune.driftFt.toFixed(1)} ft. ${crossingSummary}.`;
+      // Don't speak the summary here -- Navigate.svelte:start() will
+      // announce "Navigation started. X beacons and Y crossings ahead..."
+      // immediately after this returns, and using `interrupt: true` here
+      // would cancel that. The summary is still visible on-screen and in
+      // the aria-live region for screen readers.
       onPlanned(trip);
     } catch (err) {
       error = `Routing failed: ${(err as Error).message}`;

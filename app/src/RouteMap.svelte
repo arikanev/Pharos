@@ -21,6 +21,7 @@
   import "leaflet/dist/leaflet.css";
 
   import type { LonLat } from "./lib/beacon";
+  import type { CrossingWaypoint } from "./lib/crossings";
 
   interface Props {
     routeCoords: readonly LonLat[];
@@ -29,6 +30,7 @@
     userPos: LonLat | null;
     accuracyM: number | null;
     arrivalRadiusFt: number;
+    crossings?: readonly CrossingWaypoint[];
   }
 
   const {
@@ -38,6 +40,7 @@
     userPos,
     accuracyM,
     arrivalRadiusFt,
+    crossings = [],
   }: Props = $props();
 
   const FT_PER_M = 3.28084;
@@ -46,6 +49,7 @@
   let map: L.Map | null = null;
   let routeLine: L.Polyline | null = null;
   let beaconLayer: L.LayerGroup | null = null;
+  let crossingLayer: L.LayerGroup | null = null;
   let userMarker: L.CircleMarker | null = null;
   let userAccuracy: L.Circle | null = null;
   let arrivalRing: L.Circle | null = null;
@@ -69,7 +73,9 @@
     ).addTo(map);
 
     beaconLayer = L.layerGroup().addTo(map);
+    crossingLayer = L.layerGroup().addTo(map);
     redrawBeacons();
+    redrawCrossings();
 
     // Initial fit: route bounds.
     if (routeLine.getBounds().isValid()) {
@@ -125,6 +131,47 @@
       });
       if (map) arrivalRing.addTo(map);
     }
+  }
+
+  function redrawCrossings(): void {
+    if (!crossingLayer) return;
+    crossingLayer.clearLayers();
+    crossings.forEach((c) => {
+      const [lng, lat] = c.pos;
+      // Use orange/red palette for crossings so they stand out from
+      // beacons (blue/green) and the user dot (red+white outline).
+      const fill =
+        c.kind === "signals" ? "#1a6" : // green: traffic-signalled
+        c.kind === "marked"  ? "#d80" : // amber: marked but no signal
+        c.kind === "unmarked" ? "#c33" : // red: unmarked, dangerous
+        "#888";                          // grey: unknown
+      const tooltip = describeCrossing(c);
+      L.circleMarker([lat, lng], {
+        radius: 6,
+        color: "#fff",
+        weight: 2,
+        fillColor: fill,
+        fillOpacity: 1,
+      })
+        .bindTooltip(tooltip, {
+          direction: "top",
+          offset: [0, -6],
+          className: "crossing-label",
+        })
+        .addTo(crossingLayer!);
+    });
+  }
+
+  function describeCrossing(c: CrossingWaypoint): string {
+    const parts: string[] = [];
+    if (c.kind === "signals") parts.push("signal");
+    else if (c.kind === "marked") parts.push("marked");
+    else if (c.kind === "unmarked") parts.push("unmarked");
+    else parts.push("crossing");
+    if (c.tactile === true) parts.push("tactile");
+    if (c.audibleSignal === true) parts.push("audible");
+    if (c.refugeIsland) parts.push("island");
+    return parts.join(" / ");
   }
 
   function updateUser(): void {
@@ -183,6 +230,11 @@
   });
 
   $effect(() => {
+    void crossings;
+    redrawCrossings();
+  });
+
+  $effect(() => {
     void userPos;
     void accuracyM;
     updateUser();
@@ -211,6 +263,19 @@
     box-shadow: none;
   }
   :global(.beacon-label::before) {
+    display: none;
+  }
+  :global(.crossing-label) {
+    background: #fffbe6;
+    color: #5a3a00;
+    border: 1px solid #d80;
+    border-radius: 0.25rem;
+    padding: 0 0.3rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    box-shadow: none;
+  }
+  :global(.crossing-label::before) {
     display: none;
   }
 </style>

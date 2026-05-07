@@ -65,6 +65,17 @@ export async function arrivalHaptic(): Promise<void> {
   fallbackVibrate([60, 40, 60]);
 }
 
+export async function crossingHaptic(): Promise<void> {
+  // Two heavy taps, then a short pause: distinctly different from the
+  // single "you've arrived at a beacon" medium impact.
+  try {
+    await Haptics.impact({ style: ImpactStyle.Heavy });
+    await new Promise((r) => setTimeout(r, 120));
+    await Haptics.impact({ style: ImpactStyle.Heavy });
+  } catch { /* */ }
+  fallbackVibrate([100, 80, 100]);
+}
+
 export async function finalHaptic(): Promise<void> {
   try {
     await Haptics.notification({ type: NotificationType.Success });

@@ -12,6 +12,7 @@
 import type { LonLat } from "./beacon";
 import type { TuneResult } from "./beacon";
 import type { RouteResult } from "./routing";
+import type { CrossingWaypoint } from "./crossings";
 
 export interface Trip {
   savedAt: number;
@@ -22,6 +23,9 @@ export interface Trip {
   driftBudgetFt: number;
   route: RouteResult;
   tune: TuneResult;
+  /** OSM-sourced street crossings projected onto the route. May be empty
+   *  if Overpass was unavailable or the route had none nearby. */
+  crossings?: CrossingWaypoint[];
 }
 
 const DB_NAME = "pharos";

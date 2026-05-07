@@ -1,11 +1,11 @@
 /**
  * Spatial audio guidance engine.
  *
- *     [ToneBuffer] -> [Source] -> [Panner] -> [DistGain] -> [Gate] -> [Master] -> dest
- *                                    ^           ^           ^
- *                                    |           |           |
- *                              lateral cue    distance     on/off-axis
- *                                          attenuation    envelope
+ *     [ToneBuffer] -> [Source] -> [Panner] -> [DistGain] -> [AccGain] -> [Gate] -> [Master] -> dest
+ *                                    ^           ^            ^           ^
+ *                                    |           |            |           |
+ *                              lateral cue    distance    GPS-accuracy   on/off-axis
+ *                                          attenuation    confidence       envelope
  *
  * Two panner implementations are runtime-swappable for A/B testing:
  *
@@ -51,6 +51,13 @@ const DIST_GAIN_FLOOR = 0.4;
 // are facing the beacon". 0.97 ~= within 14 deg of dead-on.
 const ALIGN_CONTINUOUS_THRESHOLD = 0.97;
 
+// GPS-accuracy attenuation. <= ACC_FULL_M: full gain (GPS is roughly the
+// arrival-radius scale, so audio cues are trustworthy). >= ACC_MUTE_M:
+// silent (GPS noise dwarfs everything; the panner is just lying). Linear
+// ramp in between.
+const ACC_FULL_M = 10;
+const ACC_MUTE_M = 40;
+
 export type AudioMode = "continuous" | "rhythmic";
 export type PanMode = "stereo" | "hrtf";
 
@@ -65,11 +72,13 @@ export class AudioEngine {
   private master: GainNode | null = null;
   private panner: StereoPannerNode | PannerNode | null = null;
   private distanceGain: GainNode | null = null;
+  private accuracyGain: GainNode | null = null;
   private gate: GainNode | null = null;        // alignment / rhythm gate
   private toneSrc: AudioBufferSourceNode | null = null;
   private toneBuf: AudioBuffer | null = null;
   private pingBuf: AudioBuffer | null = null;
   private finalBuf: AudioBuffer | null = null;
+  private crossingBuf: AudioBuffer | null = null;
 
   private mode: AudioMode;
   private panMode: PanMode;
@@ -105,9 +114,13 @@ export class AudioEngine {
     this.gate.gain.value = 0;        // start silent until start()
     this.gate.connect(this.master);
 
+    this.accuracyGain = this.ctx.createGain();
+    this.accuracyGain.gain.value = 1;
+    this.accuracyGain.connect(this.gate);
+
     this.distanceGain = this.ctx.createGain();
     this.distanceGain.gain.value = 1;
-    this.distanceGain.connect(this.gate);
+    this.distanceGain.connect(this.accuracyGain);
 
     this.panner = this.createPanner(this.panMode);
     this.panner.connect(this.distanceGain);
@@ -115,8 +128,13 @@ export class AudioEngine {
     // Synthesize buffers up front (cheap, all <1s).
     const sr = this.ctx.sampleRate;
     this.toneBuf = makeToneBuffer(this.ctx, sr);
-    this.pingBuf = makePingBuffer(this.ctx, sr, [659.25, 830.61], 0.25);   // E5 + G#5
-    this.finalBuf = makePingBuffer(this.ctx, sr, [523.25, 659.25, 783.99], 0.6); // C5 E5 G5
+    this.pingBuf = makePingBuffer(this.ctx, sr, [659.25, 830.61], 0.25);   // E5 + G#5 (arrival, ascending)
+    this.finalBuf = makePingBuffer(this.ctx, sr, [523.25, 659.25, 783.99], 0.6); // C5 E5 G5 (final chord)
+    // Crossing alert: A4 + A#4 (minor 2nd, deliberately dissonant) so
+    // it doesn't blend in with the per-beacon arrival ping. Longer decay
+    // (~0.5s) gives it a "warning" feel rather than a "you got there"
+    // feel.
+    this.crossingBuf = makePingBuffer(this.ctx, sr, [440.0, 466.16], 0.5);
   }
 
   /** Begin guidance audio. Call after init() + setBeacon() + setUserPose(). */
@@ -265,6 +283,31 @@ export class AudioEngine {
   /** Play the final-destination chord. */
   playFinal(): void {
     this.playOneShot(this.finalBuf);
+  }
+
+  /** Play the crossing-warning chime. Always full volume (bypasses gate). */
+  playCrossing(): void {
+    this.playOneShot(this.crossingBuf);
+  }
+
+  /**
+   * Update GPS accuracy in metres. Drives a confidence gain stage:
+   * full audio when the fix is tighter than ACC_FULL_M, ramping to silent
+   * by ACC_MUTE_M. Pass +Infinity / NaN to fully mute.
+   */
+  setGpsAccuracy(accuracyM: number): void {
+    if (!this.ctx || !this.accuracyGain) return;
+    let gain: number;
+    if (!Number.isFinite(accuracyM) || accuracyM <= 0) {
+      gain = 0;
+    } else if (accuracyM <= ACC_FULL_M) {
+      gain = 1;
+    } else if (accuracyM >= ACC_MUTE_M) {
+      gain = 0;
+    } else {
+      gain = (ACC_MUTE_M - accuracyM) / (ACC_MUTE_M - ACC_FULL_M);
+    }
+    setSmooth(this.accuracyGain.gain, gain, this.ctx.currentTime);
   }
 
   /** Stop all sound and disconnect; safe to call repeatedly. */
