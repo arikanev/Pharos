@@ -36,10 +36,16 @@
 
   let { trip, onExit }: Props = $props();
 
-  // Distance threshold to count a beacon as "arrived". 15 ft is a hair below
-  // typical civilian GPS HDOP, so the trigger lands once the user is within
-  // the noise floor of being there.
-  const ARRIVAL_RADIUS_FT = 15;
+  // Adaptive arrival radius. NYC urban-canyon GPS routinely reports ±15-25 m
+  // accuracy, which is 50-80 ft -- *bigger* than any reasonable fixed
+  // arrival radius. We size the radius to ~1.5x current GPS accuracy,
+  // floored at MIN_ARRIVAL_FT (open-sky / good-fix case) and capped at
+  // MAX_ARRIVAL_FT (an inhumane reading shouldn't make every beacon
+  // 200 ft "arrival"). This same radius is used for backtrack detection
+  // so "at this beacon" means the same thing in both directions.
+  const MIN_ARRIVAL_FT = 15;
+  const MAX_ARRIVAL_FT = 50;
+  const ARRIVAL_ACCURACY_MULTIPLIER = 1.5;
 
   // Crossing-warning tunables. The user gets `WARN_SEC` of heads-up at
   // their current walking speed, with a hard floor of MIN_WARN_FT so the
@@ -68,12 +74,25 @@
   const OFF_ROUTE_FIXES = 3;
   const OFF_ROUTE_REANNOUNCE_MS = 30_000;
 
-  // Re-acquisition: if the user lingers within `BACKTRACK_RADIUS_FT` of a
-  // beacon they've already passed for `BACKTRACK_FIXES` consecutive GPS
-  // fixes, snap `beaconIdx` back so we re-target the next beacon AFTER
-  // the one they returned to. This recovers from accidental
+  // Snap-to-route (map-matching) thresholds. When the toggle is on, we
+  // blend the raw GPS reading toward its projection on the route as
+  // accuracy degrades. Below SNAP_NO_SNAP_M the raw GPS is trusted as-is;
+  // above SNAP_FULL_SNAP_M the user is fully on the polyline; in between
+  // we linearly interpolate. We refuse to snap if the raw position is
+  // farther than SNAP_MAX_OFFROUTE_FT from the polyline -- the user is
+  // genuinely off-route and we shouldn't lie about their position.
+  const SNAP_NO_SNAP_M = 8;
+  const SNAP_FULL_SNAP_M = 25;
+  const SNAP_MAX_OFFROUTE_FT = 75;
+
+  // Re-acquisition: if the user lingers within the current arrival radius
+  // of a beacon they've already passed for `BACKTRACK_FIXES` consecutive
+  // GPS fixes, snap `beaconIdx` back so we re-target the next beacon
+  // AFTER the one they returned to. This recovers from accidental
   // arrival-jitter advances and from genuine wrong-turn backtracks.
-  const BACKTRACK_RADIUS_FT = 30;
+  // Backtrack uses the same adaptive radius as arrival so "at beacon"
+  // means the same thing in both directions; the debounce here is what
+  // prevents transient overlap from triggering a stale snap-back.
   const BACKTRACK_FIXES = 3;
 
   let beaconIdx = $state(0);
@@ -81,13 +100,41 @@
   let bearingDiff = $state<number | null>(null);
   let position = $state<PositionFix | null>(null);
   let heading = $state<HeadingFix | null>(null);
-  let mode = $state<AudioMode>("continuous");
-  let panMode = $state<PanMode>("stereo");
+  // The position we *actually* navigate from -- raw GPS in good conditions,
+  // blended toward the route polyline as accuracy degrades (see
+  // `effectiveUserPos`). Surfaced to RouteMap so the user dot reflects
+  // what the engine believes, not what the GPS bounced to last frame.
+  let userMapPos = $state<LonLat | null>(null);
+  // Defaults chosen for blind-pedestrian UX: rhythmic separates distance
+  // from alignment cleanly (pulse rate = alignment, pulse volume =
+  // distance), and HRTF gives front/back disambiguation that StereoPanner
+  // can't (StereoPanner collapses front and back to the same center pan,
+  // disambiguated only by gate gain). Both can be toggled at runtime.
+  let mode = $state<AudioMode>("rhythmic");
+  let panMode = $state<PanMode>("hrtf");
+  // Snap-to-route is on by default: in NYC the urban-canyon GPS error
+  // dominates user-experience problems (audio panning hops sideways,
+  // arrivals fail to fire). Trusting the route polyline as a prior
+  // dramatically stabilises both. Power users can flip to Raw if they
+  // want to see what the raw GPS thinks.
+  let snapToRoute = $state(true);
   let running = $state(false);
   let error = $state<string | null>(null);
   let arrived = $state(false);
 
   const totalBeacons = $derived(trip?.tune.result.beacons.length ?? 0);
+
+  // Current arrival radius scales with the latest reported GPS accuracy
+  // so the trigger always matches reality on the ground: tight in open
+  // sky, generous in urban canyons. Used by both arrival detection and
+  // backtrack snap-back for consistency, and surfaced to RouteMap so
+  // the visual ring grows/shrinks with the actual trigger threshold.
+  const arrivalRadiusFt = $derived.by(() => {
+    const a = position?.accuracyM;
+    if (a == null || !Number.isFinite(a) || a <= 0) return MIN_ARRIVAL_FT;
+    const adaptive = a * FT_PER_M * ARRIVAL_ACCURACY_MULTIPLIER;
+    return Math.max(MIN_ARRIVAL_FT, Math.min(MAX_ARRIVAL_FT, adaptive));
+  });
 
   // Cumulative polyline distances in feet, indexed parallel to
   // `trip.route.coords`. Lets `projectPointOntoPolylineFt` answer
@@ -95,6 +142,21 @@
   const routeCumFt = $derived(
     trip ? cumulativePolylineLengthsFt(trip.route.coords) : [],
   );
+
+  // Each beacon's distance along the route polyline. Computed once per
+  // trip (the projection runs O(coords) per beacon). Used by
+  // `findNearestPastBeacon` so backtrack snap-back picks the actually
+  // most-recently-passed beacon -- haversine distance can pick an
+  // earlier beacon when the route doubles back or curves tightly,
+  // causing a spurious snap to an idx beyond the no-op guard.
+  const beaconAlongFts = $derived.by(() => {
+    if (!trip || !routeCumFt.length) return [];
+    return trip.tune.result.beacons.map(
+      (b) =>
+        projectPointOntoPolylineFt(b, trip.route.coords, routeCumFt)
+          .distanceAlongRouteFt,
+    );
+  });
 
   let engine: AudioEngine | null = null;
   let unsubPos: (() => void) | null = null;
@@ -127,6 +189,7 @@
     offRouteCount = 0;
     lastOffRouteAnnounceAt = 0;
     backtrackCandidate = null;
+    userMapPos = null;
   });
 
   function nextBeacon(): LonLat | null {
@@ -136,18 +199,78 @@
     return beacons[beaconIdx];
   }
 
-  function update(pos: LonLat, headingDeg: number): void {
+  // Map-matching blend: lerp the raw GPS reading toward its projection
+  // on the route polyline as accuracy degrades. The route is a strong
+  // prior in dense urban areas where GPS routinely drifts 50+ ft
+  // sideways. We refuse to snap when the raw position is genuinely
+  // far off the polyline -- the user really has wandered, and lying
+  // about that would suppress legitimate off-route detection.
+  function effectiveUserPos(
+    raw: LonLat,
+    footPos: LonLat,
+    accuracyM: number | null,
+    offRouteFt: number,
+  ): LonLat {
+    if (!snapToRoute) return raw;
+    if (accuracyM == null || !Number.isFinite(accuracyM)) return raw;
+    if (offRouteFt > SNAP_MAX_OFFROUTE_FT) return raw;
+    if (accuracyM <= SNAP_NO_SNAP_M) return raw;
+    const t = Math.min(
+      1,
+      (accuracyM - SNAP_NO_SNAP_M) / (SNAP_FULL_SNAP_M - SNAP_NO_SNAP_M),
+    );
+    return [
+      raw[0] + (footPos[0] - raw[0]) * t,
+      raw[1] + (footPos[1] - raw[1]) * t,
+    ];
+  }
+
+  // `update()` runs on every position AND heading fix so the audio pose
+  // and on-screen direction stay smooth at ~30 Hz. The debounced
+  // navigation logic (crossing, off-route, backtrack, arrival) MUST only
+  // run on real GPS fixes (~1-4 Hz) -- otherwise the per-update counters
+  // tick at heading rate and the "3-fix" debounces collapse to ~100 ms,
+  // causing rapid-fire snap-backs that interrupt their own TTS.
+  function update(
+    pos: LonLat,
+    headingDeg: number,
+    isPositionFix: boolean,
+  ): void {
     if (!trip || !engine) return;
     const target = nextBeacon();
     if (!target) return;
-    const d = haversineFt(pos, target);
+
+    // Project the raw GPS reading onto the route polyline once. The
+    // projection drives both the snap-to-route blend below AND the
+    // raw-vs-route safety checks (crossings, off-route, backtrack)
+    // further down -- those need the *raw* offset, not the snapped one,
+    // or off-route detection would silently never fire under snap.
+    const proj = routeCumFt.length
+      ? projectPointOntoPolylineFt(pos, trip.route.coords, routeCumFt)
+      : null;
+
+    // Effective navigation position: raw GPS in good conditions, blended
+    // toward the polyline as accuracy degrades. Drives audio pose,
+    // distance/bearing display, arrival check, and the on-screen user
+    // dot so what the user hears matches what the engine believes.
+    const effPos = proj
+      ? effectiveUserPos(pos, proj.foot, position?.accuracyM ?? null, proj.offRouteFt)
+      : pos;
+    userMapPos = effPos;
+
+    const d = haversineFt(effPos, target);
     distanceFt = d;
-    const targetBearing = bearingDeg(pos, target);
+    const targetBearing = bearingDeg(effPos, target);
     let diff = targetBearing - headingDeg;
     diff = ((diff + 540) % 360) - 180;
     bearingDiff = diff;
 
-    engine.setUserPose(pos, target, headingDeg);
+    engine.setUserPose(effPos, target, headingDeg);
+
+    // Everything below this line depends on a NEW position; skip on
+    // heading-only updates so the debounced safety logic isn't ticked
+    // ~30x per second by the gyro/magnetometer stream.
+    if (!isPositionFix) return;
 
     // Feed GPS accuracy into the audio engine so the spatial cue gets
     // attenuated when the fix is unreliable -- avoids "audio confidently
@@ -156,17 +279,11 @@
       engine.setGpsAccuracy(position.accuracyM);
     }
 
-    // Project the user once onto the route polyline; the result feeds
-    // crossing warnings, off-route detection, and backtrack snap-back.
-    const proj = routeCumFt.length
-      ? projectPointOntoPolylineFt(pos, trip.route.coords, routeCumFt)
-      : null;
-
     checkCrossings(proj);
     checkOffRoute(proj);
-    checkBacktrack(pos);
+    checkBacktrack(proj);
 
-    if (d <= ARRIVAL_RADIUS_FT) {
+    if (d <= arrivalRadiusFt) {
       const isFinal = beaconIdx === totalBeacons - 1;
       if (isFinal) {
         arrived = true;
@@ -176,6 +293,12 @@
         void stop();
       } else {
         beaconIdx += 1;
+        // Clear any in-flight backtrack candidate so a counter that was
+        // accumulating against the just-passed beacon doesn't immediately
+        // snap us back. Without this, a user who lingers in the overlap
+        // zone between two beacons can hear "Beacon N" then "Returning
+        // to beacon N" within a few seconds.
+        backtrackCandidate = null;
         engine.playArrival();
         void arrivalHaptic();
         announce(`Beacon ${beaconIdx} of ${totalBeacons - 1}.`, { dedupeMs: 4000 });
@@ -279,19 +402,23 @@
     }
   }
 
-  // Find the closest *already-passed* beacon to the user. Used by the
-  // backtrack-snap logic; returns null when there are no past beacons
-  // (we haven't reached beacon 0 yet) or when the closest is still too
-  // far to count as "the user is at it".
+  // Find the closest *already-passed* beacon to the user, measured by
+  // distance along the route polyline (NOT haversine). Along-route
+  // distance is monotonic along the path -- beacon i+1 is always
+  // further along than beacon i regardless of how the polyline curves
+  // or doubles back. Haversine isn't monotonic, so it can pick
+  // beacon[N-2] as "nearest" when the user is genuinely between
+  // beacon[N-1] and beacon[N], which then defeats the no-op guard in
+  // `snapToBeacon` and causes spurious "Returning to beacon X"
+  // announcements.
   function findNearestPastBeacon(
-    pos: LonLat,
+    userAlongFt: number,
   ): { idx: number; distFt: number } | null {
-    if (!trip || beaconIdx === 0) return null;
-    const beacons = trip.tune.result.beacons;
+    if (!trip || beaconIdx === 0 || !beaconAlongFts.length) return null;
     let bestIdx = -1;
     let bestDist = Infinity;
     for (let i = 0; i < beaconIdx; i++) {
-      const d = haversineFt(pos, beacons[i]);
+      const d = Math.abs(userAlongFt - beaconAlongFts[i]);
       if (d < bestDist) {
         bestDist = d;
         bestIdx = i;
@@ -303,10 +430,15 @@
 
   // Backtrack snap-back. If the user lingers near a past beacon for
   // several consecutive fixes, rewind beaconIdx so the audio engine
-  // re-targets the beacon AFTER the one they returned to.
-  function checkBacktrack(pos: LonLat): void {
-    const nearest = findNearestPastBeacon(pos);
-    if (!nearest || nearest.distFt > BACKTRACK_RADIUS_FT) {
+  // re-targets the beacon AFTER the one they returned to. The radius
+  // tracks the same adaptive arrival radius -- consistent definition
+  // of "at this beacon" in both directions.
+  function checkBacktrack(
+    proj: { distanceAlongRouteFt: number } | null,
+  ): void {
+    if (!proj) return;
+    const nearest = findNearestPastBeacon(proj.distanceAlongRouteFt);
+    if (!nearest || nearest.distFt > arrivalRadiusFt) {
       backtrackCandidate = null;
       return;
     }
@@ -316,12 +448,12 @@
       backtrackCandidate = { idx: nearest.idx, count: 1 };
     }
     if (backtrackCandidate.count >= BACKTRACK_FIXES) {
-      snapToBeacon(pos, nearest.idx);
+      snapToBeacon(proj.distanceAlongRouteFt, nearest.idx);
       backtrackCandidate = null;
     }
   }
 
-  function snapToBeacon(pos: LonLat, pastIdx: number): void {
+  function snapToBeacon(userAlongFt: number, pastIdx: number): void {
     if (!trip) return;
     const newBeaconIdx = pastIdx + 1;
     // No-op when the user is genuinely between current beacons; the
@@ -332,11 +464,7 @@
 
     // Re-arm crossing announcements that are now ahead of us again, so
     // the user gets warned about them on the second approach.
-    if (routeCumFt.length && trip.crossings && trip.crossings.length) {
-      const proj = projectPointOntoPolylineFt(
-        pos, trip.route.coords, routeCumFt,
-      );
-      const userAlongFt = proj.distanceAlongRouteFt;
+    if (trip.crossings && trip.crossings.length) {
       const reArmed = new Set<number>();
       for (const i of crossingsAnnounced) {
         const c = trip.crossings[i];
@@ -372,12 +500,12 @@
       unsubPos = handle.position.subscribe((p) => {
         if (!p) return;
         position = p;
-        if (heading) update(p.position, heading.headingDeg);
+        if (heading) update(p.position, heading.headingDeg, true);
       });
       unsubHeading = handle.heading.subscribe((h) => {
         if (!h) return;
         heading = h;
-        if (position) update(position.position, h.headingDeg);
+        if (position) update(position.position, h.headingDeg, false);
       });
 
       // 4. Audio loop.
@@ -441,6 +569,11 @@
     });
   }
 
+  function changeSnap(on: boolean): void {
+    snapToRoute = on;
+    announce(on ? "Snap to route enabled." : "Raw GPS.", { dedupeMs: 500 });
+  }
+
   onDestroy(() => { void stop(); });
 
   function fmtBearing(diff: number | null): string {
@@ -467,9 +600,9 @@
       routeCoords={trip.route.coords}
       beacons={trip.tune.result.beacons}
       nextBeaconIdx={beaconIdx}
-      userPos={position?.position ?? null}
+      userPos={userMapPos ?? position?.position ?? null}
       accuracyM={position?.accuracyM ?? null}
-      arrivalRadiusFt={ARRIVAL_RADIUS_FT}
+      arrivalRadiusFt={arrivalRadiusFt}
       crossings={trip.crossings ?? []}
     />
 
@@ -539,6 +672,16 @@
         <button type="button" class:selected={panMode === "hrtf"}
                 aria-pressed={panMode === "hrtf"}
                 onclick={() => changePanMode("hrtf")}>HRTF</button>
+      </fieldset>
+
+      <fieldset class="mode-switch">
+        <legend>GPS</legend>
+        <button type="button" class:selected={!snapToRoute}
+                aria-pressed={!snapToRoute}
+                onclick={() => changeSnap(false)}>Raw</button>
+        <button type="button" class:selected={snapToRoute}
+                aria-pressed={snapToRoute}
+                onclick={() => changeSnap(true)}>Snap to route</button>
       </fieldset>
 
       <button type="button" class="danger big" onclick={stop}>Stop</button>
