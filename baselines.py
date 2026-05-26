@@ -384,11 +384,24 @@ def print_scaling_table(
 # Plot: DP vs Ours, worst-drift annotation
 # --------------------------------------------------------------------------- #
 
-def _local_xy(coords: Sequence[LonLat]) -> List[Tuple[float, float]]:
-    """Project (lon, lat) to local (x_ft, y_ft) centred on the first point."""
+def _local_xy(
+    coords: Sequence[LonLat],
+    origin: Optional[LonLat] = None,
+) -> List[Tuple[float, float]]:
+    """Project (lon, lat) to local (x_ft, y_ft).
+
+    Origin defaults to `coords[0]` when not supplied, which is convenient for
+    projecting a whole route in one go. Pass an explicit `origin` when
+    projecting individual points that must share the same origin as some
+    earlier projection (e.g. worst-drift chord endpoints relative to the
+    route they live on) -- otherwise every single-point projection would
+    return (0, 0) because the point becomes its own origin.
+    """
     if not coords:
         return []
-    lon0, lat0 = coords[0]
+    if origin is None:
+        origin = coords[0]
+    lon0, lat0 = origin
     lat0_rad = math.radians(lat0)
     sx = _DEG_TO_FT * math.cos(lat0_rad)
     sy = _DEG_TO_FT
@@ -482,9 +495,12 @@ def _plot_panel(
     drift_budget_ft: Optional[float] = None,
 ) -> None:
     """Render one method's beacons over the input polyline + worst-drift call-out."""
-    osm_xy = _local_xy(osm_coords)
-    sample_xy = _local_xy(samples)
-    beacon_xy = _local_xy(beacons)
+    # Anchor every projection to the route's first coordinate so all sets
+    # (polyline, resample, beacons, worst-drift annotations) share one origin.
+    origin = osm_coords[0] if osm_coords else None
+    osm_xy = _local_xy(osm_coords, origin)
+    sample_xy = _local_xy(samples, origin)
+    beacon_xy = _local_xy(beacons, origin)
 
     # Underlying polyline drawn as a thick band so the methods' chords
     # are visually offset from it whenever they cut across.
@@ -510,9 +526,9 @@ def _plot_panel(
     info = _worst_drift_chord(beacons, samples)
     if info is not None:
         _, chord_a, chord_b, worst_pt, drift_ft = info
-        a_xy = _local_xy([chord_a])[0]
-        b_xy = _local_xy([chord_b])[0]
-        p_xy = _local_xy([worst_pt])[0]
+        a_xy = _local_xy([chord_a], origin)[0]
+        b_xy = _local_xy([chord_b], origin)[0]
+        p_xy = _local_xy([worst_pt], origin)[0]
         foot = _perp_foot_xy(p_xy, a_xy, b_xy)
         # Highlight the chord that produced the worst drift -- contrasting
         # colour drawn ABOVE the beacon-coloured chord polyline so the
