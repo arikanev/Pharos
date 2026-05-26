@@ -61,9 +61,33 @@ const ACC_MUTE_M = 40;
 export type AudioMode = "continuous" | "rhythmic";
 export type PanMode = "stereo" | "hrtf";
 
+// The looping signal that gets spatialized into the beacon.
+//
+// HRTF localization works by frequency-dependent inter-aural cues
+// (ITD/ILD/pinna spectral filtering); pure sines provide almost none
+// of those cues. Broadband and transient-rich signals localize *much*
+// more sharply, especially near the front-axis where ITD/ILD vanish.
+// Open-ear hardware (e.g. Meta Ray-Bans) makes this gap worse because
+// L<->R crosstalk smears whatever cues are there. Offering a choice
+// lets users find what their ears + hardware actually decode best.
+//
+//   - "tone":  the original two-detuned-sines chorus + slow tremolo.
+//              Familiar, lowest listening fatigue, but poor HRTF
+//              resolution near 0 deg azimuth.
+//   - "sonar": 2 pings/sec, each a 200 ms downward 1400 -> 700 Hz
+//              sweep. The sweep gives broadband spectral content;
+//              the sharp transient gives clean ITD cues. Classic
+//              "submarine ping" -- famously easy to localize.
+//   - "tick":  5 broadband-noise clicks/sec. Pure transient, full
+//              spectrum -- best HRTF localization in the engine,
+//              plus the lowest listening fatigue (audio is mostly
+//              silence between clicks).
+export type BeaconSound = "tone" | "sonar" | "tick";
+
 export interface AudioEngineOptions {
   mode?: AudioMode;
   panMode?: PanMode;
+  beaconSound?: BeaconSound;
   masterGain?: number;
 }
 
@@ -82,6 +106,7 @@ export class AudioEngine {
 
   private mode: AudioMode;
   private panMode: PanMode;
+  private beaconSound: BeaconSound;
   private gateMasterGain = 1;
   private rhythmTimer: number | null = null;
   private alignment = 0;       // 0 = pointing wrong way, 1 = on-axis
@@ -93,6 +118,7 @@ export class AudioEngine {
   constructor(opts: AudioEngineOptions = {}) {
     this.mode = opts.mode ?? "continuous";
     this.panMode = opts.panMode ?? "stereo";
+    this.beaconSound = opts.beaconSound ?? "tone";
     this.gateMasterGain = opts.masterGain ?? 0.85;
   }
 
@@ -127,7 +153,7 @@ export class AudioEngine {
 
     // Synthesize buffers up front (cheap, all <1s).
     const sr = this.ctx.sampleRate;
-    this.toneBuf = makeToneBuffer(this.ctx, sr);
+    this.toneBuf = makeBeaconBuffer(sr, this.beaconSound);
     this.pingBuf = makePingBuffer(this.ctx, sr, [659.25, 830.61], 0.25);   // E5 + G#5 (arrival, ascending)
     this.finalBuf = makePingBuffer(this.ctx, sr, [523.25, 659.25, 783.99], 0.6); // C5 E5 G5 (final chord)
     // Crossing alert: A4 + A#4 (minor 2nd, deliberately dissonant) so
@@ -235,6 +261,31 @@ export class AudioEngine {
     this.mode = mode;
     this.stopRhythmScheduler();
     this.applyAlignment(this.alignment);
+  }
+
+  /**
+   * Switch the looping beacon signal. Re-synthesises the buffer and, if
+   * already playing, replaces the running source (AudioBufferSourceNode
+   * buffers are immutable after start()). The brief gap during the swap
+   * is intentional UX feedback that the change took effect.
+   */
+  setBeaconSound(sound: BeaconSound): void {
+    if (this.beaconSound === sound) return;
+    this.beaconSound = sound;
+    if (!this.ctx) return;
+    this.toneBuf = makeBeaconBuffer(this.ctx.sampleRate, sound);
+    if (this.running && this.panner) {
+      if (this.toneSrc) {
+        try { this.toneSrc.stop(); } catch { /* already stopped */ }
+        try { this.toneSrc.disconnect(); } catch { /* not connected */ }
+        this.toneSrc = null;
+      }
+      this.toneSrc = this.ctx.createBufferSource();
+      this.toneSrc.buffer = this.toneBuf;
+      this.toneSrc.loop = true;
+      this.toneSrc.connect(this.panner);
+      this.toneSrc.start();
+    }
   }
 
   /** Switch between stereo and HRTF panning. Hot-swaps the panner node. */
@@ -418,7 +469,15 @@ function setSmooth(
   param.setTargetAtTime(value, now, tc);
 }
 
-function makeToneBuffer(_ctx: AudioContext, sr: number): AudioBuffer {
+function makeBeaconBuffer(sr: number, sound: BeaconSound): AudioBuffer {
+  switch (sound) {
+    case "sonar": return makeSonarBuffer(sr);
+    case "tick":  return makeTickBuffer(sr);
+    case "tone":  return makeToneBuffer(sr);
+  }
+}
+
+function makeToneBuffer(sr: number): AudioBuffer {
   // 2-second loop: two detuned partials (440 Hz + 442 Hz) plus a slow tremolo
   // at 3 Hz. The detuning gives a subtle, non-headache-inducing chorus; the
   // tremolo provides a slow rhythmic anchor that makes "is the audio
@@ -436,6 +495,65 @@ function makeToneBuffer(_ctx: AudioContext, sr: number): AudioBuffer {
     const sample =
       0.5 * Math.sin(f1 * t) + 0.5 * Math.sin(f2 * t);
     data[i] = 0.4 * tremolo * sample;
+  }
+  return buf;
+}
+
+function makeSonarBuffer(sr: number): AudioBuffer {
+  // 2-second loop with 4 pings (one every 500 ms). Each ping is a 200 ms
+  // linear downward sweep 1400 -> 700 Hz with a fast 8 ms attack and a
+  // ~70 ms exponential decay. The sweep covers an octave of bandwidth so
+  // the brain hears the entire HRTF response as a glissando, dramatically
+  // sharpening azimuth perception near the front-axis where pure tones
+  // collapse. The hard onset gives clean ITD cues.
+  const dur = 2.0;
+  const n = Math.floor(dur * sr);
+  const buf = new AudioBuffer({ numberOfChannels: 1, length: n, sampleRate: sr });
+  const data = buf.getChannelData(0);
+  const pingPeriod = 0.5;
+  const pingDur = 0.20;
+  const f0 = 1400, f1 = 700;
+  const attack = 0.008;
+  const decayTC = 0.07;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const tInPing = t % pingPeriod;
+    if (tInPing >= pingDur) continue;
+    // phase(t) = 2*pi * integral of f(tau) dtau, with f linear in tau.
+    const phase =
+      2 * Math.PI *
+      (f0 * tInPing + (f1 - f0) * tInPing * tInPing / (2 * pingDur));
+    const env = tInPing < attack
+      ? tInPing / attack
+      : Math.exp(-(tInPing - attack) / decayTC);
+    data[i] = 0.5 * env * Math.sin(phase);
+  }
+  return buf;
+}
+
+function makeTickBuffer(sr: number): AudioBuffer {
+  // 2-second loop with 10 broadband-noise ticks (one every 200 ms). Each
+  // tick is a 15 ms white-noise burst with a ~1.5 ms linear attack and a
+  // ~4 ms exponential decay. Pure transient, full spectrum -- HRTF gets
+  // every bit of inter-aural and pinna-spectral cue available, and the
+  // brain has 100M years of practice localising clicks (footsteps,
+  // snapping twigs). Best center-axis discrimination of the three sounds.
+  const dur = 2.0;
+  const n = Math.floor(dur * sr);
+  const buf = new AudioBuffer({ numberOfChannels: 1, length: n, sampleRate: sr });
+  const data = buf.getChannelData(0);
+  const tickPeriod = 0.20;
+  const tickDur = 0.015;
+  const attack = 0.0015;
+  const decayTC = 0.004;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const tInTick = t % tickPeriod;
+    if (tInTick >= tickDur) continue;
+    const env = tInTick < attack
+      ? tInTick / attack
+      : Math.exp(-(tInTick - attack) / decayTC);
+    data[i] = 0.55 * env * (Math.random() * 2 - 1);
   }
   return buf;
 }

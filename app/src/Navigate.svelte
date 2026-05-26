@@ -6,7 +6,12 @@
     haversineFt,
     type LonLat,
   } from "./lib/beacon";
-  import { AudioEngine, type AudioMode, type PanMode } from "./lib/audio";
+  import {
+    AudioEngine,
+    type AudioMode,
+    type BeaconSound,
+    type PanMode,
+  } from "./lib/audio";
   import {
     requestOrientationPermission,
     startSensors,
@@ -112,6 +117,11 @@
   // disambiguated only by gate gain). Both can be toggled at runtime.
   let mode = $state<AudioMode>("rhythmic");
   let panMode = $state<PanMode>("hrtf");
+  // Default to the original tone for backwards-compatible UX. Users with
+  // open-ear hardware (e.g. Meta Ray-Bans) where ITD/ILD cues smear
+  // typically get noticeably sharper center-axis discrimination from
+  // "tick" or "sonar" -- the toggle below lets them A/B in the field.
+  let beaconSound = $state<BeaconSound>("tone");
   // Snap-to-route is on by default: in NYC the urban-canyon GPS error
   // dominates user-experience problems (audio panning hops sideways,
   // arrivals fail to fire). Trusting the route polyline as a prior
@@ -490,7 +500,7 @@
       await requestOrientationPermission();
 
       // 2. Audio context (also requires user gesture).
-      engine = new AudioEngine({ mode, panMode });
+      engine = new AudioEngine({ mode, panMode, beaconSound });
       await engine.init();
 
       // 3. Sensors.
@@ -572,6 +582,13 @@
   function changeSnap(on: boolean): void {
     snapToRoute = on;
     announce(on ? "Snap to route enabled." : "Raw GPS.", { dedupeMs: 500 });
+  }
+
+  function changeBeaconSound(s: BeaconSound): void {
+    beaconSound = s;
+    engine?.setBeaconSound(s);
+    const label = s === "sonar" ? "Sonar beacon." : s === "tick" ? "Tick beacon." : "Tone beacon.";
+    announce(label, { dedupeMs: 500 });
   }
 
   onDestroy(() => { void stop(); });
@@ -662,6 +679,19 @@
         <button type="button" class:selected={mode === "rhythmic"}
                 aria-pressed={mode === "rhythmic"}
                 onclick={() => changeMode("rhythmic")}>Rhythmic</button>
+      </fieldset>
+
+      <fieldset class="mode-switch">
+        <legend>Beacon</legend>
+        <button type="button" class:selected={beaconSound === "tone"}
+                aria-pressed={beaconSound === "tone"}
+                onclick={() => changeBeaconSound("tone")}>Tone</button>
+        <button type="button" class:selected={beaconSound === "sonar"}
+                aria-pressed={beaconSound === "sonar"}
+                onclick={() => changeBeaconSound("sonar")}>Sonar</button>
+        <button type="button" class:selected={beaconSound === "tick"}
+                aria-pressed={beaconSound === "tick"}
+                onclick={() => changeBeaconSound("tick")}>Tick</button>
       </fieldset>
 
       <fieldset class="mode-switch">
