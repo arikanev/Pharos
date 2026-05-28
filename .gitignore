@@ -1,0 +1,18 @@
+# Python virtualenvs (the conversion script creates .pathscout-venv/ which
+# bundles torch + numpy + opencv — easily 1+ GB, multiple files > 100 MB).
+.pathscout-venv/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp

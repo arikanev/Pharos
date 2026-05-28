@@ -86,9 +86,41 @@ inject boilerplate but you must add the user-facing usage strings):
 <string>Pharos uses your location to guide you along your route.</string>
 <key>NSMotionUsageDescription</key>
 <string>Pharos uses the compass to pan audio toward the next beacon.</string>
+<key>NSCameraUsageDescription</key>
+<string>Pharos uses the camera only while Path Scout is on, to detect sidewalks and curbs in front of you.</string>
 ```
 
 Build for a device (Simulator does not produce real GPS or compass data).
+
+### Path Scout (optional, iOS only)
+
+A separate on-device YOLO11-seg model labels road / sidewalk / curb up
+/ curb down from the rear camera. When enabled on the Navigate screen,
+lifting the phone from flat to vertical (~90°) triggers a single-shot
+scan every ~3 seconds and announces an open-path / curb sentence
+("Path is clear, continue straight." / "Curb down 6 feet ahead, step
+down cautiously." etc.) via the same `announce()` pipeline.
+
+One-time setup:
+
+```bash
+# 1. From the repo root, convert your trained model:
+python3 -m venv .pathscout-venv
+.pathscout-venv/bin/pip install --upgrade ultralytics coremltools
+.pathscout-venv/bin/python convert_to_coreml.py /path/to/best.pt
+# -> writes ./PathScout.mlpackage
+
+# 2. Open Xcode (npx cap open ios) and drag PathScout.mlpackage into the
+#    App target. Make sure "Target Membership: App" is checked. Xcode
+#    will compile it into PathScout.mlmodelc at build time.
+
+# 3. Build + run on a real device (the simulator doesn't have a back camera).
+```
+
+The toggle is hidden in the UI until `PathScout.isAvailable()` returns
+true, so it stays inert on PWA / Android / iOS-without-the-model.
+Implementation: [`app/ios/App/App/PathScout.swift`](app/ios/App/App/PathScout.swift)
++ [`app/src/lib/pathScout.ts`](app/src/lib/pathScout.ts).
 
 ## Project map
 

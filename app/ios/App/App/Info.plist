@@ -49,5 +49,7 @@
 	<string>Pharos uses your location to guide you along your route.</string>
 	<key>NSMotionUsageDescription</key>
 	<string>Pharos uses the compass to pan audio toward the next beacon.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Pharos uses the camera only while Path Scout is on, to detect sidewalks and curbs in front of you.</string>
 </dict>
 </plist>

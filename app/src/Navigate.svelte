@@ -31,6 +31,14 @@
     projectPointOntoPolylineFt,
     type CrossingWaypoint,
   } from "./lib/crossings";
+  import {
+    safeIsAvailable as pathScoutIsAvailable,
+    scan as pathScoutScan,
+    startCamera as pathScoutStartCamera,
+    stopCamera as pathScoutStopCamera,
+    watchPosture,
+    type PostureWatcher,
+  } from "./lib/pathScout";
   import type { Trip } from "./lib/storage";
   import RouteMap from "./RouteMap.svelte";
 
@@ -178,6 +186,19 @@
   let lastOffRouteAnnounceAt = 0;
   let backtrackCandidate: { idx: number; count: number } | null = null;
 
+  // Path Scout (iOS-only on-device segmentation). Default OFF: requires the
+  // user to bundle the .mlpackage and opt in. When ON, we install a posture
+  // watcher; lifting the phone from flat to vertical starts the camera and
+  // runs one scan every PATH_SCOUT_INTERVAL_MS while held vertical. The
+  // first scan is delayed to give the camera time to autofocus.
+  let pathScoutAvailable = $state(false);
+  let pathScoutEnabled = $state(false);
+  let pathScoutActive = $state(false);  // currently scanning (phone vertical)
+  let postureWatcher: PostureWatcher | null = null;
+  let pathScoutLoopHandle: ReturnType<typeof setTimeout> | null = null;
+  const PATH_SCOUT_FIRST_DELAY_MS = 700;
+  const PATH_SCOUT_INTERVAL_MS = 3000;
+
   // Auto-start navigation as soon as a trip is available. The plan() flow
   // in Plan.svelte ran inside a user gesture, and Navigate mounts inside
   // that same call stack, so iOS WKWebView typically still has user
@@ -201,6 +222,84 @@
     backtrackCandidate = null;
     userMapPos = null;
   });
+
+  // Lazy availability check (iOS + model bundled). Runs once on mount.
+  $effect(() => {
+    void pathScoutIsAvailable().then((ok) => {
+      pathScoutAvailable = ok;
+    });
+  });
+
+  // Install / tear down the posture watcher when the user toggles
+  // path-scout on/off. The watcher itself is cheap (one event listener);
+  // the camera is only started when the phone actually goes vertical.
+  $effect(() => {
+    if (!pathScoutEnabled) {
+      teardownPathScout();
+      return;
+    }
+    if (postureWatcher) return;
+    postureWatcher = watchPosture({
+      onLift: () => { void onPathScoutLift(); },
+      onLower: () => { void onPathScoutLower(); },
+    });
+  });
+
+  async function onPathScoutLift(): Promise<void> {
+    if (pathScoutActive) return;
+    pathScoutActive = true;
+    try {
+      await pathScoutStartCamera();
+      // First scan after a short delay so autofocus has settled.
+      pathScoutLoopHandle = setTimeout(() => void runPathScoutLoop(),
+                                       PATH_SCOUT_FIRST_DELAY_MS);
+    } catch (e) {
+      announce(`Path scout could not start: ${(e as Error).message}`,
+               { interrupt: true });
+      pathScoutActive = false;
+    }
+  }
+
+  async function onPathScoutLower(): Promise<void> {
+    if (!pathScoutActive) return;
+    pathScoutActive = false;
+    if (pathScoutLoopHandle) {
+      clearTimeout(pathScoutLoopHandle);
+      pathScoutLoopHandle = null;
+    }
+    await pathScoutStopCamera();
+  }
+
+  async function runPathScoutLoop(): Promise<void> {
+    if (!pathScoutActive) return;
+    const result = await pathScoutScan();
+    if (result && result.guidance) {
+      // `interrupt: true` so a stale beacon announcement doesn't sit on
+      // top of the safety-relevant scout sentence. dedupeMs is long
+      // enough that successive "Path is clear, continue straight."
+      // calls don't chatter.
+      announce(result.guidance, { interrupt: true, dedupeMs: 2500 });
+    }
+    if (pathScoutActive) {
+      pathScoutLoopHandle = setTimeout(() => void runPathScoutLoop(),
+                                       PATH_SCOUT_INTERVAL_MS);
+    }
+  }
+
+  function teardownPathScout(): void {
+    if (postureWatcher) {
+      postureWatcher.stop();
+      postureWatcher = null;
+    }
+    if (pathScoutLoopHandle) {
+      clearTimeout(pathScoutLoopHandle);
+      pathScoutLoopHandle = null;
+    }
+    if (pathScoutActive) {
+      pathScoutActive = false;
+      void pathScoutStopCamera();
+    }
+  }
 
   function nextBeacon(): LonLat | null {
     if (!trip) return null;
@@ -560,7 +659,20 @@
     if (unsubPos) { unsubPos(); unsubPos = null; }
     if (unsubHeading) { unsubHeading(); unsubHeading = null; }
     if (stopSensors) { await stopSensors(); stopSensors = null; }
+    teardownPathScout();
     await releaseWakeLock();
+  }
+
+  function changePathScout(on: boolean): void {
+    pathScoutEnabled = on;
+    if (on) {
+      announce(
+        "Path scout enabled. Lift the phone vertical to scan ahead.",
+        { dedupeMs: 1000 },
+      );
+    } else {
+      announce("Path scout off.", { dedupeMs: 1000 });
+    }
   }
 
   function changeMode(m: AudioMode): void {
@@ -713,6 +825,18 @@
                 aria-pressed={snapToRoute}
                 onclick={() => changeSnap(true)}>Snap to route</button>
       </fieldset>
+
+      {#if pathScoutAvailable}
+        <fieldset class="mode-switch">
+          <legend>Path scout {pathScoutActive ? "(scanning)" : ""}</legend>
+          <button type="button" class:selected={!pathScoutEnabled}
+                  aria-pressed={!pathScoutEnabled}
+                  onclick={() => changePathScout(false)}>Off</button>
+          <button type="button" class:selected={pathScoutEnabled}
+                  aria-pressed={pathScoutEnabled}
+                  onclick={() => changePathScout(true)}>On</button>
+        </fieldset>
+      {/if}
 
       <button type="button" class="danger big" onclick={stop}>Stop</button>
     {:else}
