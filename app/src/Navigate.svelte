@@ -25,6 +25,7 @@
     crossingHaptic,
     finalHaptic,
     releaseWakeLock,
+    tickHaptic,
   } from "./lib/a11y";
   import {
     cumulativePolylineLengthsFt,
@@ -33,11 +34,13 @@
   } from "./lib/crossings";
   import {
     safeIsAvailable as pathScoutIsAvailable,
+    availableEngines as pathScoutEngines,
     scan as pathScoutScan,
     startCamera as pathScoutStartCamera,
     stopCamera as pathScoutStopCamera,
     watchPosture,
     type PostureWatcher,
+    type PathScoutEngine,
   } from "./lib/pathScout";
   import type { Trip } from "./lib/storage";
   import RouteMap from "./RouteMap.svelte";
@@ -109,6 +112,10 @@
   const BACKTRACK_FIXES = 3;
 
   let beaconIdx = $state(0);
+  // One-shot guard: on the first GPS fix of a trip we align beaconIdx to
+  // wherever the user physically is along the route (see syncStartBeacon),
+  // so starting mid-route doesn't send them back to beacon 1.
+  let startSynced = $state(false);
   let distanceFt = $state<number | null>(null);
   let bearingDiff = $state<number | null>(null);
   let position = $state<PositionFix | null>(null);
@@ -185,6 +192,10 @@
   let offRouteCount = 0;
   let lastOffRouteAnnounceAt = 0;
   let backtrackCandidate: { idx: number; count: number } | null = null;
+  // Furthest along-route distance reached this trip (forward-only). Backtrack
+  // snap-back is gated on regressing well behind this, so lateral GPS jitter
+  // between dense beacons never reverts the target during a transition.
+  let maxAlongFt = 0;
 
   // Path Scout (iOS-only on-device segmentation). Default OFF: requires the
   // user to bundle the .mlpackage and opt in. When ON, we install a posture
@@ -192,12 +203,30 @@
   // runs one scan every PATH_SCOUT_INTERVAL_MS while held vertical. The
   // first scan is delayed to give the camera time to autofocus.
   let pathScoutAvailable = $state(false);
-  let pathScoutEnabled = $state(false);
+  let pathScoutEnabled = $state(true);   // on by default; only acts when available
   let pathScoutActive = $state(false);  // currently scanning (phone vertical)
   let postureWatcher: PostureWatcher | null = null;
   let pathScoutLoopHandle: ReturnType<typeof setTimeout> | null = null;
   const PATH_SCOUT_FIRST_DELAY_MS = 700;
   const PATH_SCOUT_INTERVAL_MS = 3000;
+  // Debug preview (default off): when on AND path scout is active, the scan
+  // loop runs faster and requests an overlaid camera frame to validate the
+  // model. Audio guidance stays throttled to PATH_SCOUT_INTERVAL_MS so the
+  // faster cadence doesn't make it chatter.
+  let pathScoutPreview = $state(false);
+  let pathScoutPreviewSrc = $state<string | null>(null);
+  let lastScoutAnnounceAt = 0;
+  const PATH_SCOUT_PREVIEW_INTERVAL_MS = 300;
+  // Inference engine A/B: same model + downstream, swapped runtime. CoreML
+  // (Vision) is default; ONNX runs the native ONNX Runtime. `engineAvail`
+  // gates the toggle so we never request an engine that wasn't bundled, and
+  // `pathScoutLatencyMs` surfaces the per-scan inference time for comparison.
+  let pathScoutEngine = $state<PathScoutEngine>("coreml");
+  let engineAvail = $state<{ coreml: boolean; onnx: boolean }>({
+    coreml: false,
+    onnx: false,
+  });
+  let pathScoutLatencyMs = $state<number | null>(null);
 
   // Auto-start navigation as soon as a trip is available. The plan() flow
   // in Plan.svelte ran inside a user gesture, and Navigate mounts inside
@@ -221,12 +250,20 @@
     lastOffRouteAnnounceAt = 0;
     backtrackCandidate = null;
     userMapPos = null;
+    beaconIdx = 0;
+    startSynced = false;
+    maxAlongFt = 0;
   });
 
   // Lazy availability check (iOS + model bundled). Runs once on mount.
   $effect(() => {
     void pathScoutIsAvailable().then((ok) => {
       pathScoutAvailable = ok;
+    });
+    void pathScoutEngines().then((e) => {
+      engineAvail = e;
+      // Prefer CoreML when present; otherwise fall back to whatever shipped.
+      if (!e.coreml && e.onnx) pathScoutEngine = "onnx";
     });
   });
 
@@ -248,6 +285,11 @@
   async function onPathScoutLift(): Promise<void> {
     if (pathScoutActive) return;
     pathScoutActive = true;
+    // Immediate feedback the instant the lift is detected, before the
+    // camera/model spin up -- confirms posture detection independently of
+    // whether the scan ultimately produces guidance.
+    void tickHaptic();
+    announce("Scanning ahead.", { interrupt: true, dedupeMs: 1500 });
     try {
       await pathScoutStartCamera();
       // First scan after a short delay so autofocus has settled.
@@ -263,6 +305,7 @@
   async function onPathScoutLower(): Promise<void> {
     if (!pathScoutActive) return;
     pathScoutActive = false;
+    pathScoutPreviewSrc = null;
     if (pathScoutLoopHandle) {
       clearTimeout(pathScoutLoopHandle);
       pathScoutLoopHandle = null;
@@ -272,17 +315,33 @@
 
   async function runPathScoutLoop(): Promise<void> {
     if (!pathScoutActive) return;
-    const result = await pathScoutScan();
+    const wantPreview = pathScoutPreview;
+    const result = await pathScoutScan({
+      engine: pathScoutEngine,
+      ...(wantPreview ? { preview: true } : {}),
+    });
+    if (result && typeof result.latencyMs === "number") {
+      pathScoutLatencyMs = result.latencyMs;
+    }
+    if (wantPreview && result?.previewJpeg) {
+      pathScoutPreviewSrc = `data:image/jpeg;base64,${result.previewJpeg}`;
+    }
     if (result && result.guidance) {
-      // `interrupt: true` so a stale beacon announcement doesn't sit on
-      // top of the safety-relevant scout sentence. dedupeMs is long
-      // enough that successive "Path is clear, continue straight."
-      // calls don't chatter.
-      announce(result.guidance, { interrupt: true, dedupeMs: 2500 });
+      // Throttle the spoken guidance to the normal interval even when the
+      // preview loop is polling fast, so it doesn't chatter. `interrupt:
+      // true` so a stale beacon announcement doesn't sit on top of the
+      // safety-relevant scout sentence.
+      const now = Date.now();
+      if (now - lastScoutAnnounceAt >= PATH_SCOUT_INTERVAL_MS) {
+        lastScoutAnnounceAt = now;
+        announce(result.guidance, { interrupt: true, dedupeMs: 2500 });
+      }
     }
     if (pathScoutActive) {
-      pathScoutLoopHandle = setTimeout(() => void runPathScoutLoop(),
-                                       PATH_SCOUT_INTERVAL_MS);
+      pathScoutLoopHandle = setTimeout(
+        () => void runPathScoutLoop(),
+        wantPreview ? PATH_SCOUT_PREVIEW_INTERVAL_MS : PATH_SCOUT_INTERVAL_MS,
+      );
     }
   }
 
@@ -299,6 +358,7 @@
       pathScoutActive = false;
       void pathScoutStopCamera();
     }
+    pathScoutPreviewSrc = null;
   }
 
   function nextBeacon(): LonLat | null {
@@ -346,6 +406,16 @@
     isPositionFix: boolean,
   ): void {
     if (!trip || !engine) return;
+
+    // On the very first GPS fix of a trip, align the target beacon to the
+    // user's actual position along the route. Without this, a user who
+    // begins already standing at a later beacon gets routed back to
+    // beacon 1. Runs once (startSynced), only on a real position fix.
+    if (isPositionFix && !startSynced) {
+      startSynced = true;
+      syncStartBeacon(pos);
+    }
+
     const target = nextBeacon();
     if (!target) return;
 
@@ -388,6 +458,13 @@
       engine.setGpsAccuracy(position.accuracyM);
     }
 
+    // Track furthest forward progress (position fixes only, on-route) so the
+    // backtrack hysteresis below can tell a real regression from transition
+    // jitter.
+    if (proj && proj.offRouteFt <= SNAP_MAX_OFFROUTE_FT) {
+      maxAlongFt = Math.max(maxAlongFt, proj.distanceAlongRouteFt);
+    }
+
     checkCrossings(proj);
     checkOffRoute(proj);
     checkBacktrack(proj);
@@ -401,7 +478,20 @@
         announce("You have arrived at your destination.", { interrupt: true });
         void stop();
       } else {
-        beaconIdx += 1;
+        // Collapse dense beacons inside one (possibly large) GPS radius into
+        // a single advance + announcement instead of chattering one beacon
+        // per fix: fast-forward to the first beacon still ahead of the user.
+        const userAlongFt = proj?.distanceAlongRouteFt ?? null;
+        let landed = beaconIdx + 1;
+        if (userAlongFt != null) {
+          while (
+            landed < totalBeacons - 1 &&
+            beaconAlongFts[landed] <= userAlongFt + arrivalRadiusFt
+          ) {
+            landed++;
+          }
+        }
+        beaconIdx = landed;
         // Clear any in-flight backtrack candidate so a counter that was
         // accumulating against the just-passed beacon doesn't immediately
         // snap us back. Without this, a user who lingers in the overlap
@@ -546,6 +636,14 @@
     proj: { distanceAlongRouteFt: number } | null,
   ): void {
     if (!proj) return;
+    // Only snap back on GENUINE regression -- well behind furthest progress.
+    // During a transition the user hovers near peak progress, so jitter that
+    // makes a past beacon look "nearest" no longer reverts the target; we
+    // stay locked on the next beacon.
+    if (maxAlongFt - proj.distanceAlongRouteFt <= arrivalRadiusFt) {
+      backtrackCandidate = null;
+      return;
+    }
     const nearest = findNearestPastBeacon(proj.distanceAlongRouteFt);
     if (!nearest || nearest.distFt > arrivalRadiusFt) {
       backtrackCandidate = null;
@@ -562,6 +660,40 @@
     }
   }
 
+  // One-shot start alignment. If the user begins the trip already at (or
+  // past) a later beacon, advance beaconIdx to the first beacon still
+  // ahead of them rather than targeting beacon 1. Mirrors the backtrack
+  // projection math but only ever moves forward, and only when the user
+  // is actually near the route polyline (otherwise we trust beacon 1).
+  function syncStartBeacon(pos: LonLat): void {
+    if (!trip || !routeCumFt.length || !beaconAlongFts.length) return;
+    const proj = projectPointOntoPolylineFt(pos, trip.route.coords, routeCumFt);
+    if (proj.offRouteFt > SNAP_MAX_OFFROUTE_FT) return;
+    const userAlongFt = proj.distanceAlongRouteFt;
+    const last = totalBeacons - 1;
+    let idx = 0;
+    while (idx < last && beaconAlongFts[idx] < userAlongFt - PASSED_FT) idx++;
+    if (idx <= beaconIdx) return;   // already targeting this beacon or further
+
+    beaconIdx = idx;
+    // Baseline forward progress at the resumed start so backtrack hysteresis
+    // is measured from here, not from along-route 0.
+    maxAlongFt = userAlongFt;
+    // Mute crossings that are now behind the resumed start point so we
+    // don't warn about intersections the user has already walked through.
+    if (trip.crossings && trip.crossings.length) {
+      const muted = new Set<number>();
+      trip.crossings.forEach((c, i) => {
+        if (c.distanceAlongRouteFt <= userAlongFt + PASSED_FT) muted.add(i);
+      });
+      crossingsAnnounced = muted;
+    }
+    announce(
+      `Starting from beacon ${idx} of ${totalBeacons - 1}.`,
+      { dedupeMs: 4000 },
+    );
+  }
+
   function snapToBeacon(userAlongFt: number, pastIdx: number): void {
     if (!trip) return;
     const newBeaconIdx = pastIdx + 1;
@@ -570,6 +702,9 @@
     if (newBeaconIdx >= beaconIdx) return;
 
     beaconIdx = newBeaconIdx;
+    // Re-baseline forward progress from here so subsequent transitions are
+    // measured against the new position, not the pre-backtrack peak.
+    maxAlongFt = userAlongFt;
 
     // Re-arm crossing announcements that are now ahead of us again, so
     // the user gets warned about them on the second approach.
@@ -663,16 +798,37 @@
     await releaseWakeLock();
   }
 
-  function changePathScout(on: boolean): void {
+  async function changePathScout(on: boolean): Promise<void> {
     pathScoutEnabled = on;
     if (on) {
+      // DeviceOrientation needs an explicit grant on iOS, and this tap is a
+      // user gesture, so (re)request here to guarantee the posture watcher
+      // actually receives beta even if navigation start didn't get it.
+      await requestOrientationPermission();
       announce(
-        "Path scout enabled. Lift the phone vertical to scan ahead.",
+        "Path scout enabled. Lift the phone upright to scan ahead.",
         { dedupeMs: 1000 },
       );
     } else {
       announce("Path scout off.", { dedupeMs: 1000 });
     }
+  }
+
+  function changePathScoutPreview(on: boolean): void {
+    pathScoutPreview = on;
+    if (!on) pathScoutPreviewSrc = null;
+    announce(on ? "Path scout preview on." : "Path scout preview off.", {
+      dedupeMs: 1000,
+    });
+  }
+
+  function changePathScoutEngine(e: PathScoutEngine): void {
+    if (pathScoutEngine === e) return;
+    pathScoutEngine = e;
+    pathScoutLatencyMs = null;   // stale reading belongs to the other engine
+    announce(e === "onnx" ? "ONNX engine." : "Core ML engine.", {
+      dedupeMs: 800,
+    });
   }
 
   function changeMode(m: AudioMode): void {
@@ -826,16 +982,62 @@
                 onclick={() => changeSnap(true)}>Snap to route</button>
       </fieldset>
 
-      {#if pathScoutAvailable}
+      <fieldset class="mode-switch">
+        <legend>
+          Path scout{#if !pathScoutAvailable} (unavailable){:else if pathScoutActive} (scanning){/if}
+        </legend>
+        <button type="button" class:selected={!pathScoutEnabled}
+                aria-pressed={!pathScoutEnabled}
+                onclick={() => void changePathScout(false)}>Off</button>
+        <button type="button" class:selected={pathScoutEnabled}
+                aria-pressed={pathScoutEnabled}
+                onclick={() => void changePathScout(true)}>On</button>
+      </fieldset>
+      {#if !pathScoutAvailable}
+        <p class="muted scout-note">
+          Path scout needs a model (Core ML and/or ONNX) bundled and the app
+          rebuilt on a device. It is inactive until then.
+        </p>
+      {:else}
         <fieldset class="mode-switch">
-          <legend>Path scout {pathScoutActive ? "(scanning)" : ""}</legend>
-          <button type="button" class:selected={!pathScoutEnabled}
-                  aria-pressed={!pathScoutEnabled}
-                  onclick={() => changePathScout(false)}>Off</button>
-          <button type="button" class:selected={pathScoutEnabled}
-                  aria-pressed={pathScoutEnabled}
-                  onclick={() => changePathScout(true)}>On</button>
+          <legend>
+            Engine{#if pathScoutLatencyMs != null} ({pathScoutLatencyMs.toFixed(0)} ms){/if}
+          </legend>
+          <button type="button" class:selected={pathScoutEngine === "coreml"}
+                  aria-pressed={pathScoutEngine === "coreml"}
+                  disabled={!engineAvail.coreml}
+                  onclick={() => changePathScoutEngine("coreml")}>Core ML</button>
+          <button type="button" class:selected={pathScoutEngine === "onnx"}
+                  aria-pressed={pathScoutEngine === "onnx"}
+                  disabled={!engineAvail.onnx}
+                  onclick={() => changePathScoutEngine("onnx")}>ONNX</button>
         </fieldset>
+        <fieldset class="mode-switch">
+          <legend>Preview (debug)</legend>
+          <button type="button" class:selected={!pathScoutPreview}
+                  aria-pressed={!pathScoutPreview}
+                  onclick={() => changePathScoutPreview(false)}>Off</button>
+          <button type="button" class:selected={pathScoutPreview}
+                  aria-pressed={pathScoutPreview}
+                  onclick={() => changePathScoutPreview(true)}>On</button>
+        </fieldset>
+      {/if}
+
+      {#if pathScoutPreview && pathScoutPreviewSrc}
+        <div class="scout-preview" role="group" aria-label="Path scout segmentation preview">
+          <p class="scout-meta">
+            {pathScoutEngine === "onnx" ? "ONNX" : "Core ML"}{#if pathScoutLatencyMs != null} · {pathScoutLatencyMs.toFixed(0)} ms{/if}
+          </p>
+          <img src={pathScoutPreviewSrc} alt="Path scout segmentation preview" />
+          <ul class="scout-legend" aria-hidden="true">
+            <li><span class="sw" style="background:#ff3b30"></span>curb down</li>
+            <li><span class="sw" style="background:#ff9500"></span>curb up</li>
+            <li><span class="sw" style="background:#007aff"></span>road</li>
+            <li><span class="sw" style="background:#34c759"></span>sidewalk</li>
+          </ul>
+          <button type="button" class="scout-close"
+                  onclick={() => changePathScoutPreview(false)}>Close preview</button>
+        </div>
       {/if}
 
       <button type="button" class="danger big" onclick={stop}>Stop</button>
@@ -860,6 +1062,51 @@
   h1 { font-size: 1.5rem; margin: 0; }
   .route { font-size: 1.05rem; }
   .muted { color: #777; }
+  .scout-note { font-size: 0.85rem; margin: 0.25rem 0 0; }
+  .scout-preview {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0;
+    padding: 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    background: #000;
+  }
+  .scout-preview img {
+    width: 100%;
+    max-width: 320px;
+    aspect-ratio: 1 / 1;
+    object-fit: contain;
+    border-radius: 6px;
+    image-rendering: pixelated;
+  }
+  .scout-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.75rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: 0.8rem;
+    color: #fff;
+  }
+  .scout-legend li { display: flex; align-items: center; gap: 0.3rem; }
+  .scout-legend .sw {
+    width: 0.9rem;
+    height: 0.9rem;
+    border-radius: 3px;
+    display: inline-block;
+  }
+  .scout-close { font-size: 0.85rem; }
+  .scout-meta {
+    margin: 0;
+    align-self: flex-start;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #fff;
+  }
   .ok { color: #1a6; font-weight: 700; }
   .big { font-size: 1.15rem; min-height: 4rem; }
   .error { color: #c33; }

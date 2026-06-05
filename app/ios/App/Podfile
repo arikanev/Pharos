@@ -17,7 +17,8 @@ end
 
 target 'App' do
   capacitor_pods
-  # Add your Pods here
+  # Native ONNX Runtime engine for Path Scout (CoreML/ONNX A/B comparison).
+  pod 'onnxruntime-objc'
 end
 
 post_install do |installer|

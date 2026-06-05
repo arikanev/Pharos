@@ -101,26 +101,62 @@ scan every ~3 seconds and announces an open-path / curb sentence
 ("Path is clear, continue straight." / "Curb down 6 feet ahead, step
 down cautiously." etc.) via the same `announce()` pipeline.
 
+The same model can run through one of two interchangeable engines,
+picked at runtime with the **Engine** toggle on the Navigate screen:
+
+- **Core ML** (`PathScout.mlpackage` -> `.mlmodelc`) via Vision.
+- **ONNX** (`PathScout.onnx`) via native ONNX Runtime (`onnxruntime-objc`,
+  CPU provider). This is the portable runtime we also hand to Android.
+
+Both feed the *identical* post-processing, so only the inference call
+and the reported `latencyMs` differ -- use it to A/B latency and the
+"how native is native" question. Each scan returns `engine` + `latencyMs`,
+surfaced in the Engine legend and the debug preview card.
+
 One-time setup:
 
 ```bash
-# 1. From the repo root, convert your trained model:
+# 1. From the repo root, convert your trained model. Default emits BOTH
+#    PathScout.mlpackage (Core ML) and PathScout.onnx; use --format to
+#    limit it (coreml | onnx | both).
 python3 -m venv .pathscout-venv
-.pathscout-venv/bin/pip install --upgrade ultralytics coremltools
+.pathscout-venv/bin/pip install --upgrade ultralytics coremltools onnx
 .pathscout-venv/bin/python convert_to_coreml.py /path/to/best.pt
-# -> writes ./PathScout.mlpackage
+# -> writes ./PathScout.mlpackage and ./PathScout.onnx
 
-# 2. Open Xcode (npx cap open ios) and drag PathScout.mlpackage into the
-#    App target. Make sure "Target Membership: App" is checked. Xcode
-#    will compile it into PathScout.mlmodelc at build time.
+# 2. Add the ONNX Runtime pod, then install:
+#    (Podfile already lists `pod 'onnxruntime-objc'`)
+(cd app/ios/App && pod install)
 
-# 3. Build + run on a real device (the simulator doesn't have a back camera).
+# 3. Open Xcode (npx cap open ios) and drag BOTH PathScout.mlpackage and
+#    PathScout.onnx into the App target. Make sure "Target Membership:
+#    App" is checked for each. Xcode compiles the mlpackage into
+#    PathScout.mlmodelc and copies PathScout.onnx as a bundled resource.
+#    (PathScout.onnx is already wired into app/ios/App/App.xcodeproj.)
+
+# 4. Build + run on a real device (the simulator doesn't have a back camera).
 ```
 
 The toggle is hidden in the UI until `PathScout.isAvailable()` returns
-true, so it stays inert on PWA / Android / iOS-without-the-model.
-Implementation: [`app/ios/App/App/PathScout.swift`](app/ios/App/App/PathScout.swift)
+true, so it stays inert on PWA / Android / iOS-without-the-model. The
+Engine buttons enable only for the engines actually bundled.
+Implementation: [`app/ios/App/App/PathScoutPlugin.swift`](app/ios/App/App/PathScoutPlugin.swift)
 + [`app/src/lib/pathScout.ts`](app/src/lib/pathScout.ts).
+
+### Path Scout on Android (follow-up)
+
+`PathScout.onnx` is cross-platform and is the only artifact that ports
+as-is. Android support is not built yet; it needs a native pipeline
+reimplemented in Kotlin (no Swift transpiles):
+
+- CameraX/Camera2 headless frame capture (the `AVCaptureSession` analog).
+- `onnxruntime-android` (AAR) loading the same `PathScout.onnx`.
+- A Kotlin port of the YOLO-seg post-processing in
+  [`PathScoutPlugin.swift`](app/ios/App/App/PathScoutPlugin.swift)
+  (decode -> NMS -> mask union -> 3x7 open-path grid -> guidance). The
+  math is identical; it's a translation, not a redesign.
+- A Capacitor plugin registered in `MainActivity` returning the same
+  result dict, so `app/src/lib/pathScout.ts` and the UI work unchanged.
 
 ## Project map
 

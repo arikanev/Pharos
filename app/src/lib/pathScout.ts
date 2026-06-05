@@ -19,11 +19,23 @@
  */
 import { registerPlugin } from "@capacitor/core";
 
+/** Inference engines the native plugin can run the same model through. */
+export type PathScoutEngine = "coreml" | "onnx";
+
+export interface EngineAvailability {
+  coreml: boolean;
+  onnx: boolean;
+}
+
 export interface PathScoutPlugin {
-  isAvailable(): Promise<{ available: boolean; modelPath: string }>;
+  isAvailable(): Promise<{
+    available: boolean;
+    modelPath: string;
+    engines?: EngineAvailability;
+  }>;
   start(): Promise<void>;
   stop(): Promise<void>;
-  scan(): Promise<ScanResult>;
+  scan(opts?: { preview?: boolean; engine?: PathScoutEngine }): Promise<ScanResult>;
 }
 
 export interface ScanResult {
@@ -46,6 +58,16 @@ export interface ScanResult {
   /** Curb visible at all (not just in the front fan). */
   curbDownPresent: boolean;
   curbUpPresent: boolean;
+  /**
+   * Debug-only: base64 JPEG (no data: prefix) of the camera frame with the
+   * segmentation masks overlaid. Present only when scan was called with
+   * `{ preview: true }`.
+   */
+  previewJpeg?: string;
+  /** Which engine actually ran this scan ("coreml" | "onnx"). */
+  engine?: PathScoutEngine;
+  /** Wall-clock inference time in milliseconds, for the CoreML/ONNX A/B. */
+  latencyMs?: number;
 }
 
 // The Capacitor proxy works fine even when the native side is absent;
@@ -61,6 +83,20 @@ export async function safeIsAvailable(): Promise<boolean> {
   }
 }
 
+/**
+ * Which engines the native side has bundled. Used to enable/disable the
+ * CoreML vs ONNX toggle so we never request an engine that didn't ship.
+ * Returns both-false when the plugin is absent (web / Android today).
+ */
+export async function availableEngines(): Promise<EngineAvailability> {
+  try {
+    const r = await Native.isAvailable();
+    return r.engines ?? { coreml: !!r.available, onnx: false };
+  } catch {
+    return { coreml: false, onnx: false };
+  }
+}
+
 export async function startCamera(): Promise<void> {
   await Native.start();
 }
@@ -69,9 +105,11 @@ export async function stopCamera(): Promise<void> {
   try { await Native.stop(); } catch { /* ok */ }
 }
 
-export async function scan(): Promise<ScanResult | null> {
+export async function scan(
+  opts?: { preview?: boolean; engine?: PathScoutEngine },
+): Promise<ScanResult | null> {
   try {
-    return await Native.scan();
+    return await Native.scan(opts);
   } catch {
     return null;
   }
@@ -105,9 +143,9 @@ type Posture = "flat" | "vertical" | "between";
  * `requestOrientationPermission()` first on iOS.
  */
 export function watchPosture(opts: PostureWatcherOptions): PostureWatcher {
-  const flatMax = opts.flatMaxBetaDeg ?? 30;
-  const vertMin = opts.verticalMinBetaDeg ?? 60;
-  const dwell = opts.dwellMs ?? 250;
+  const flatMax = opts.flatMaxBetaDeg ?? 35;
+  const vertMin = opts.verticalMinBetaDeg ?? 50;
+  const dwell = opts.dwellMs ?? 200;
 
   let lastReported: Posture = "between";
   let pendingPosture: Posture = "between";
@@ -134,9 +172,15 @@ export function watchPosture(opts: PostureWatcherOptions): PostureWatcher {
 
     const prev = lastReported;
     lastReported = pendingPosture;
-    if (prev === "flat" && pendingPosture === "vertical") opts.onLift();
-    else if (prev === "vertical" && pendingPosture === "flat") opts.onLower();
-    // flat→between or between→vertical etc. are not user-meaningful.
+    // Fire on *reaching* a terminal band, not on an adjacent flat<->vertical
+    // pair. A natural, slow lift dwells in the "between" band (30-60 deg) long
+    // enough to commit it, so a strict flat->vertical check would miss the
+    // lift entirely and only a fast flick would ever trigger. Treating
+    // "between" as a neutral pass-through fixes that: any move into "vertical"
+    // is a lift, any move into "flat" is a lower. Re-entry while already
+    // active is harmless -- onPathScoutLift/Lower guard on pathScoutActive.
+    if (pendingPosture === "vertical" && prev !== "vertical") opts.onLift();
+    else if (pendingPosture === "flat" && prev !== "flat") opts.onLower();
   };
 
   window.addEventListener("deviceorientation", onOrient);
