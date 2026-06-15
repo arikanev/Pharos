@@ -270,5 +270,3 @@ Beacons listed as lat, lon (same order as the source sheet).
   18. 40.774292, -73.970523
   19. 40.774320, -73.970383
 
-==============================================================================
-Summary: 15/15 routed; 223 beacons total; mean 14.9 per route.
