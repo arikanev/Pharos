@@ -63,6 +63,15 @@
   const MAX_ARRIVAL_FT = 50;
   const ARRIVAL_ACCURACY_MULTIPLIER = 1.5;
 
+  // Minimum along-route gap between *spoken* "Beacon N of M" announcements.
+  // Beacons can be packed tighter than this (e.g. on a curvy block the tuner
+  // drops one every few feet); announcing each one turns into a barrage of
+  // "beacon 1 of 36, beacon 2 of 36..." that talks over the spatial audio the
+  // user actually navigates by. We still chime + advance at every beacon, but
+  // only speak the count once we've travelled this far since the last spoken
+  // one, so dense clusters stay silent and let the beacon tone lead.
+  const MIN_BEACON_ANNOUNCE_GAP_FT = 75;
+
   // Crossing-warning tunables. The user gets `WARN_SEC` of heads-up at
   // their current walking speed, with a hard floor of MIN_WARN_FT so the
   // warning still fires when they're standing still or barely moving.
@@ -196,6 +205,10 @@
   // snap-back is gated on regressing well behind this, so lateral GPS jitter
   // between dense beacons never reverts the target during a transition.
   let maxAlongFt = 0;
+  // Along-route distance at which we last *spoke* a beacon count. Gates the
+  // verbal "Beacon N of M" so densely-spaced beacons don't barrage the user
+  // (see MIN_BEACON_ANNOUNCE_GAP_FT). -Infinity so the first beacon always speaks.
+  let lastBeaconAnnounceAlongFt = -Infinity;
 
   // Path Scout (iOS-only on-device segmentation). Default OFF: requires the
   // user to bundle the .mlpackage and opt in. When ON, we install a posture
@@ -253,6 +266,7 @@
     beaconIdx = 0;
     startSynced = false;
     maxAlongFt = 0;
+    lastBeaconAnnounceAlongFt = -Infinity;
   });
 
   // Lazy availability check (iOS + model bundled). Runs once on mount.
@@ -296,7 +310,7 @@
       pathScoutLoopHandle = setTimeout(() => void runPathScoutLoop(),
                                        PATH_SCOUT_FIRST_DELAY_MS);
     } catch (e) {
-      announce(`Path scout could not start: ${(e as Error).message}`,
+      announce(`OpenPath could not start: ${(e as Error).message}`,
                { interrupt: true });
       pathScoutActive = false;
     }
@@ -500,7 +514,19 @@
         backtrackCandidate = null;
         engine.playArrival();
         void arrivalHaptic();
-        announce(`Beacon ${beaconIdx} of ${totalBeacons - 1}.`, { dedupeMs: 4000 });
+        // Speak the count only if we've travelled far enough since the last
+        // spoken beacon (or we can't tell where we are). Tightly-clustered
+        // beacons still chime + advance above, but stay verbally silent so the
+        // spatial audio guidance between them isn't buried under a barrage of
+        // "Beacon N of M". See MIN_BEACON_ANNOUNCE_GAP_FT.
+        const landedAlongFt = beaconAlongFts[beaconIdx] ?? userAlongFt ?? null;
+        if (
+          landedAlongFt == null ||
+          landedAlongFt - lastBeaconAnnounceAlongFt >= MIN_BEACON_ANNOUNCE_GAP_FT
+        ) {
+          if (landedAlongFt != null) lastBeaconAnnounceAlongFt = landedAlongFt;
+          announce(`Beacon ${beaconIdx} of ${totalBeacons - 1}.`, { dedupeMs: 4000 });
+        }
       }
     }
   }
@@ -806,18 +832,18 @@
       // actually receives beta even if navigation start didn't get it.
       await requestOrientationPermission();
       announce(
-        "Path scout enabled. Lift the phone upright to scan ahead.",
+        "OpenPath enabled. Lift the phone upright to scan ahead.",
         { dedupeMs: 1000 },
       );
     } else {
-      announce("Path scout off.", { dedupeMs: 1000 });
+      announce("OpenPath off.", { dedupeMs: 1000 });
     }
   }
 
   function changePathScoutPreview(on: boolean): void {
     pathScoutPreview = on;
     if (!on) pathScoutPreviewSrc = null;
-    announce(on ? "Path scout preview on." : "Path scout preview off.", {
+    announce(on ? "OpenPath preview on." : "OpenPath preview off.", {
       dedupeMs: 1000,
     });
   }
@@ -984,7 +1010,7 @@
 
       <fieldset class="mode-switch">
         <legend>
-          Path scout{#if !pathScoutAvailable} (unavailable){:else if pathScoutActive} (scanning){/if}
+          OpenPath{#if !pathScoutAvailable} (unavailable){:else if pathScoutActive} (scanning){/if}
         </legend>
         <button type="button" class:selected={!pathScoutEnabled}
                 aria-pressed={!pathScoutEnabled}
@@ -995,7 +1021,7 @@
       </fieldset>
       {#if !pathScoutAvailable}
         <p class="muted scout-note">
-          Path scout needs a model (Core ML and/or ONNX) bundled and the app
+          OpenPath needs a model (Core ML and/or ONNX) bundled and the app
           rebuilt on a device. It is inactive until then.
         </p>
       {:else}
@@ -1024,11 +1050,11 @@
       {/if}
 
       {#if pathScoutPreview && pathScoutPreviewSrc}
-        <div class="scout-preview" role="group" aria-label="Path scout segmentation preview">
+        <div class="scout-preview" role="group" aria-label="OpenPath segmentation preview">
           <p class="scout-meta">
             {pathScoutEngine === "onnx" ? "ONNX" : "Core ML"}{#if pathScoutLatencyMs != null} · {pathScoutLatencyMs.toFixed(0)} ms{/if}
           </p>
-          <img src={pathScoutPreviewSrc} alt="Path scout segmentation preview" />
+          <img src={pathScoutPreviewSrc} alt="OpenPath segmentation preview" />
           <ul class="scout-legend" aria-hidden="true">
             <li><span class="sw" style="background:#ff3b30"></span>curb down</li>
             <li><span class="sw" style="background:#ff9500"></span>curb up</li>
