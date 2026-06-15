@@ -1,0 +1,51 @@
+Pharos in-app beacon placement (pedestrian route -> autotune, 5ft drift, 20ft step)
+Beacons listed as lat, lon (same order as the source sheet).
+==============================================================================
+
+### 81 St & N T 4.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 81 St & N T 5.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 81 St & N T1.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 81 St & N T2.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 81 St & N T3.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 97 St & N T1.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 97 St & N T2.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 97 St & N T3.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 97 St & N T4.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### 97 St & N T5.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### Central Park S & N T 4.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### Central Park S & N T 5.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### Central Park S & N T1.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### Central Park S & N T2.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+### Central Park S & N T3.gpx
+  ERROR: All routing backends for profile "pedestrian" failed
+
+==============================================================================
+Summary: 0/15 routed; 0 beacons total; mean 0.0 per route.

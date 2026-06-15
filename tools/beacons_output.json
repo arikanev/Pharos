@@ -1,0 +1,302 @@
+[
+  {
+    "name": "81 St & N T 4.gpx",
+    "start": [
+      -73.962107,
+      40.788892
+    ],
+    "end": [
+      -73.961334,
+      40.789185
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "81 St & N T 5.gpx",
+    "start": [
+      -73.962107,
+      40.788892
+    ],
+    "end": [
+      -73.961527,
+      40.789153
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "81 St & N T1.gpx",
+    "start": [
+      -73.962429,
+      40.7912
+    ],
+    "end": [
+      -73.961957,
+      40.79102
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "81 St & N T2.gpx",
+    "start": [
+      -73.964574,
+      40.791533
+    ],
+    "end": [
+      -73.964338,
+      40.791346
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "81 St & N T3.gpx",
+    "start": [
+      -73.963888,
+      40.789411
+    ],
+    "end": [
+      -73.963866,
+      40.789837
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "97 St & N T1.gpx",
+    "start": [
+      -73.962278,
+      40.791784
+    ],
+    "end": [
+      -73.961806,
+      40.792191
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "97 St & N T2.gpx",
+    "start": [
+      -73.961377,
+      40.795928
+    ],
+    "end": [
+      -73.960669,
+      40.796286
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "97 St & N T3.gpx",
+    "start": [
+      -73.9623,
+      40.791766
+    ],
+    "end": [
+      -73.962064,
+      40.791723
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "97 St & N T4.gpx",
+    "start": [
+      -73.95804,
+      40.793775
+    ],
+    "end": [
+      -73.958126,
+      40.794117
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "97 St & N T5.gpx",
+    "start": [
+      -73.95804,
+      40.793775
+    ],
+    "end": [
+      -73.958137,
+      40.794091
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "Central Park S & N T 4.gpx",
+    "start": [
+      -73.975904,
+      40.773765
+    ],
+    "end": [
+      -73.974595,
+      40.774616
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "Central Park S & N T 5.gpx",
+    "start": [
+      -73.973823,
+      40.772807
+    ],
+    "end": [
+      -73.973415,
+      40.772757
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "Central Park S & N T1.gpx",
+    "start": [
+      -73.973072,
+      40.779177
+    ],
+    "end": [
+      -73.973587,
+      40.778987
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "Central Park S & N T2.gpx",
+    "start": [
+      -73.966312,
+      40.77799
+    ],
+    "end": [
+      -73.965862,
+      40.777795
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  },
+  {
+    "name": "Central Park S & N T3.gpx",
+    "start": [
+      -73.97157,
+      40.77552
+    ],
+    "end": [
+      -73.970368,
+      40.774284
+    ],
+    "backend": null,
+    "routeLenFt": null,
+    "beaconCount": 0,
+    "driftFt": null,
+    "angleDeg": null,
+    "maxChordFt": null,
+    "minSpacingFt": null,
+    "beacons": [],
+    "error": "All routing backends for profile \"pedestrian\" failed"
+  }
+]
