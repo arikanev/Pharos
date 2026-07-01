@@ -22,6 +22,12 @@
 
   import type { LonLat } from "./lib/beacon";
   import type { CrossingWaypoint } from "./lib/crossings";
+  import {
+    mergeSurfaceSpans,
+    summarizeSurface,
+    type SurfaceClass,
+    type SurfaceSegment,
+  } from "./lib/surface";
 
   interface Props {
     routeCoords: readonly LonLat[];
@@ -31,6 +37,7 @@
     accuracyM: number | null;
     arrivalRadiusFt: number;
     crossings?: readonly CrossingWaypoint[];
+    surface?: readonly SurfaceSegment[];
   }
 
   const {
@@ -41,13 +48,30 @@
     accuracyM,
     arrivalRadiusFt,
     crossings = [],
+    surface = [],
   }: Props = $props();
+
+  // Surface palette: paved = the usual route blue, unpaved = warm brown,
+  // unknown = grey dashed (OSM has no surface tag here — missing data, not a
+  // claim either way). Kept distinct from the crossings green/amber/red.
+  const SURFACE_COLORS: Record<SurfaceClass, string> = {
+    paved: "#246",
+    unpaved: "#b4530a",
+    unknown: "#999",
+  };
+
+  // Derived once per surface change: contiguous same-class spans for drawing,
+  // and a summary for the legend.
+  const surfaceSpans = $derived(mergeSurfaceSpans(surface));
+  const surfaceSummary = $derived(summarizeSurface(surface));
+  const hasSurface = $derived(surface.length > 0);
 
   const FT_PER_M = 3.28084;
 
   let mapEl: HTMLDivElement;
   let map: L.Map | null = null;
   let routeLine: L.Polyline | null = null;
+  let surfaceLayer: L.LayerGroup | null = null;
   let beaconLayer: L.LayerGroup | null = null;
   let crossingLayer: L.LayerGroup | null = null;
   let userMarker: L.CircleMarker | null = null;
@@ -72,8 +96,10 @@
       { color: "#246", weight: 4, opacity: 0.85 },
     ).addTo(map);
 
+    surfaceLayer = L.layerGroup().addTo(map);
     beaconLayer = L.layerGroup().addTo(map);
     crossingLayer = L.layerGroup().addTo(map);
+    redrawSurface();
     redrawBeacons();
     redrawCrossings();
 
@@ -88,6 +114,39 @@
     map?.remove();
     map = null;
   });
+
+  function redrawSurface(): void {
+    if (!surfaceLayer || !routeLine) return;
+    surfaceLayer.clearLayers();
+
+    // No surface data: leave the plain blue route line as-is.
+    if (!hasSurface) {
+      routeLine.setStyle({ opacity: 0.85 });
+      return;
+    }
+
+    // Surface data present: the colored spans cover the whole route, so hide
+    // the base line (kept only for fitBounds) and draw a polyline per span.
+    routeLine.setStyle({ opacity: 0 });
+    for (const span of surfaceSpans) {
+      const pts = routeCoords
+        .slice(span.fromIdx, span.toIdx + 1)
+        .map(([lng, lat]) => [lat, lng] as L.LatLngTuple);
+      if (pts.length < 2) continue;
+      const color = SURFACE_COLORS[span.surface];
+      L.polyline(pts, {
+        color,
+        weight: 5,
+        opacity: 0.9,
+        dashArray: span.surface === "unknown" ? "5 6" : undefined,
+      })
+        .bindTooltip(
+          `${span.surface}${span.rawValue ? ` (${span.rawValue})` : ""} · ${Math.round(span.lengthFt)} ft`,
+          { direction: "top", offset: [0, -4], className: "surface-label" },
+        )
+        .addTo(surfaceLayer!);
+    }
+  }
 
   function redrawBeacons(): void {
     if (!beaconLayer || !map) return;
@@ -235,6 +294,11 @@
   });
 
   $effect(() => {
+    void surface;
+    redrawSurface();
+  });
+
+  $effect(() => {
     void userPos;
     void accuracyM;
     updateUser();
@@ -242,6 +306,21 @@
 </script>
 
 <div class="map" bind:this={mapEl} role="img" aria-label="Route map (visual only)"></div>
+
+{#if hasSurface}
+  <div class="surface-legend" aria-hidden="true">
+    <span class="swatch paved"></span> Paved
+    <span class="swatch unpaved"></span> Unpaved
+    <span class="swatch unknown"></span> Unknown
+    <span class="legend-stat">
+      {#if surfaceSummary.pavedFt + surfaceSummary.unpavedFt === 0}
+        surface unknown
+      {:else}
+        {Math.round(surfaceSummary.unpavedFraction * 100)}% unpaved
+      {/if}
+    </span>
+  </div>
+{/if}
 
 <style>
   .map {
@@ -277,5 +356,53 @@
   }
   :global(.crossing-label::before) {
     display: none;
+  }
+  :global(.surface-label) {
+    background: #fff;
+    color: #111;
+    border: 1px solid #888;
+    border-radius: 0.25rem;
+    padding: 0 0.3rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    box-shadow: none;
+  }
+  :global(.surface-label::before) {
+    display: none;
+  }
+
+  .surface-legend {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: #333;
+  }
+  .surface-legend .swatch {
+    display: inline-block;
+    width: 0.9rem;
+    height: 0.25rem;
+    border-radius: 1px;
+  }
+  .surface-legend .swatch.paved {
+    background: #246;
+  }
+  .surface-legend .swatch.unpaved {
+    background: #b4530a;
+  }
+  .surface-legend .swatch.unknown {
+    background: repeating-linear-gradient(
+      90deg,
+      #999 0,
+      #999 4px,
+      transparent 4px,
+      transparent 8px
+    );
+  }
+  .surface-legend .legend-stat {
+    margin-left: auto;
+    font-weight: 600;
   }
 </style>
