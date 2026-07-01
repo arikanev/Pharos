@@ -915,6 +915,7 @@
       accuracyM={position?.accuracyM ?? null}
       arrivalRadiusFt={arrivalRadiusFt}
       crossings={trip.crossings ?? []}
+      surface={trip.surface ?? []}
     />
 
     {#if !running && !arrived}

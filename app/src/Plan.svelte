@@ -4,6 +4,7 @@
   import { autotune, polylineLengthFt, type LonLat } from "./lib/beacon";
   import { fetchRoute, geocode, type GeocodeResult } from "./lib/routing";
   import { fetchCrossings } from "./lib/crossings";
+  import { fetchSurfaces, summarizeSurface } from "./lib/surface";
   import { saveCurrentTrip, type Trip } from "./lib/storage";
   import { announce } from "./lib/a11y";
   import PickPointMap from "./PickPointMap.svelte";
@@ -163,11 +164,12 @@
     announce("Planning route.", { interrupt: true });
     try {
       const route = await fetchRoute(s.pos, e.pos, "pedestrian");
-      // Run beacon placement and the OSM crossing query in parallel; the
-      // crossing fetch is best-effort and never blocks routing.
-      const [tune, crossings] = await Promise.all([
+      // Run beacon placement and the OSM Overpass queries in parallel; the
+      // crossing and surface fetches are best-effort and never block routing.
+      const [tune, crossings, surface] = await Promise.all([
         Promise.resolve(autotune(route.coords, driftFt, { stepFt })),
         fetchCrossings(route.coords).catch(() => []),
+        fetchSurfaces(route.coords).catch(() => []),
       ]);
       const lengthFt = polylineLengthFt(route.coords);
       const trip: Trip = {
@@ -180,13 +182,19 @@
         route,
         tune,
         crossings,
+        surface,
       };
       await saveCurrentTrip(trip);
       const crossingSummary =
         crossings.length === 1
           ? "1 street crossing"
           : `${crossings.length} street crossings`;
-      summary = `${tune.beaconCount} beacons over ${Math.round(lengthFt).toLocaleString()} ft. Worst drift ${tune.driftFt.toFixed(1)} ft. ${crossingSummary}.`;
+      const surf = summarizeSurface(surface);
+      const surfaceSummary =
+        surf.pavedFt + surf.unpavedFt === 0
+          ? "Surface unknown"
+          : `${Math.round(surf.unpavedFraction * 100)}% unpaved`;
+      summary = `${tune.beaconCount} beacons over ${Math.round(lengthFt).toLocaleString()} ft. Worst drift ${tune.driftFt.toFixed(1)} ft. ${crossingSummary}. ${surfaceSummary}.`;
       // Don't speak the summary here -- Navigate.svelte:start() will
       // announce "Navigation started. X beacons and Y crossings ahead..."
       // immediately after this returns, and using `interrupt: true` here

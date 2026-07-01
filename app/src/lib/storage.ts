@@ -13,6 +13,7 @@ import type { LonLat } from "./beacon";
 import type { TuneResult } from "./beacon";
 import type { RouteResult } from "./routing";
 import type { CrossingWaypoint } from "./crossings";
+import type { SurfaceSegment } from "./surface";
 
 export interface Trip {
   savedAt: number;
@@ -26,6 +27,9 @@ export interface Trip {
   /** OSM-sourced street crossings projected onto the route. May be empty
    *  if Overpass was unavailable or the route had none nearby. */
   crossings?: CrossingWaypoint[];
+  /** OSM-sourced per-segment surface labels (paved/unpaved/unknown). May be
+   *  empty if Overpass was unavailable. */
+  surface?: SurfaceSegment[];
 }
 
 const DB_NAME = "pharos";
